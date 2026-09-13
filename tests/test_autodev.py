@@ -404,6 +404,72 @@ class Interruption(TempCwd):
         autodev.kill_group(proc)          # must not raise
 
 
+class Budget(TempCwd):
+    """The ceiling on a single run: the usage guard only keeps the subscription happy."""
+
+    def orch(self, **cfg):
+        conf = dict(autodev.DEFAULTS)
+        conf.update(cfg)
+        state = autodev.new_state("spec.md", conf)
+        Path(".autodev").mkdir(exist_ok=True)
+        o = autodev.Orchestrator(state)
+        o.run_started = time.time()
+        o.guard.refresh = lambda force=False: None
+        o.notify = lambda msg: None
+        return o
+
+    def test_no_ceiling_by_default(self):
+        o = self.orch()
+        o.sessions_this_run = 500
+        o.run_started = time.time() - 72 * 3600
+        self.assertIsNone(o.budget_exceeded())
+        o.check_stop()                     # does not raise
+
+    def test_the_session_ceiling_stops_the_run(self):
+        o = self.orch(max_sessions=2)
+        o.sessions_this_run = 1
+        self.assertIsNone(o.budget_exceeded())
+        o.sessions_this_run = 2
+        with self.assertRaises(util.StopRequested) as e:
+            o.check_stop()
+        self.assertIn("--max-sessions 2", str(e.exception))
+
+    def test_the_hour_ceiling_stops_the_run(self):
+        o = self.orch(max_hours=1.5)
+        o.run_started = time.time() - 2 * 3600
+        with self.assertRaises(util.StopRequested) as e:
+            o.check_stop()
+        self.assertIn("--max-hours 1.5", str(e.exception))
+
+    def test_a_usage_pause_past_the_deadline_stops_instead_of_sleeping(self):
+        """Regression: the run slept until the limit reset, however late that was."""
+        o = self.orch(max_hours=1)
+        o.run_started = time.time() - 30 * 60          # 30 min left
+        o.guard.observe({"rateLimitType": "five_hour", "utilization": 0.99,
+                         "resetsAt": time.time() + 3 * 3600})
+        o.sleep_with_stop = lambda seconds: self.fail("slept past the budget instead of stopping")
+        with self.assertRaises(util.StopRequested) as e:
+            o.wait_for_usage()
+        self.assertIn("--max-hours", str(e.exception))
+
+    def test_a_usage_pause_that_fits_still_waits(self):
+        o = self.orch(max_hours=8)
+        o.run_started = time.time()
+        o.guard.observe({"rateLimitType": "five_hour", "utilization": 0.99,
+                         "resetsAt": time.time() + 1})
+        slept = []
+        o.sleep_with_stop = lambda seconds: slept.append(seconds)
+        o.guard.over = lambda: (False, "", None) if slept else (True, "5h at 99%", time.time() + 1)
+        self.assertTrue(o.wait_for_usage())
+        self.assertTrue(slept)
+
+    def test_the_reason_reaches_progress_and_status(self):
+        o = self.orch(max_sessions=1)
+        o.state.update(status="stopped", stop_reason="--max-sessions 1 reached")
+        o.render_progress()
+        self.assertIn("--max-sessions 1 reached", Path(".autodev/PROGRESS.md").read_text())
+
+
 class RunEntry(TempCwd):
     """What `run` does before the orchestrator starts: the archive, the resume, the base branch."""
 

@@ -65,6 +65,8 @@ DEFAULTS = {
     "max_review_rounds": 2,
     "max_impl_runs": 3,
     "max_e2e_fix": 3,
+    "max_hours": 0.0,        # stop the run after this much wall clock (0 = no ceiling)
+    "max_sessions": 0,       # stop after this many sessions started in this run (0 = no ceiling)
     # stack profile + end-to-end + documentation
     "profile": "",           # name of a file in profiles/ (architect corrects it into .autodev/PROFILE.md)
     "e2e": "auto",           # auto = run the e2e step on user-facing phases; off = never
@@ -304,6 +306,8 @@ class Orchestrator:
         self.supports_prompts_none = False
         self.claude_flags: set = set()
         self.held_back: list = []
+        self.run_started = 0.0
+        self.sessions_this_run = 0
         self.tampering: list = []
         self.autonomy = ""
         self.github: GitHub | None = None
@@ -559,6 +563,29 @@ class Orchestrator:
         if STOP_FILE.exists():
             STOP_FILE.unlink()
             raise StopRequested("STOP file")
+        over = self.budget_exceeded()
+        if over:
+            raise StopRequested(over)
+
+    def budget_deadline(self) -> float:
+        """When `--max-hours` runs out, or 0 if there is no ceiling."""
+        hours = float(self.cfg.get("max_hours") or 0)
+        return self.run_started + hours * 3600 if hours and self.run_started else 0.0
+
+    def budget_exceeded(self) -> str | None:
+        """Why this run has to stop now, or None.
+
+        The budget is per `run`: the usage guard only keeps the subscription happy, and without a
+        ceiling a long roadmap can keep starting sessions for days. Resuming grants a new budget,
+        which is the point — the developer decides to spend more."""
+        deadline = self.budget_deadline()
+        if deadline and time.time() >= deadline:
+            return (f"--max-hours {float(self.cfg['max_hours']):g} reached "
+                    f"({(time.time() - self.run_started) / 3600:.1f} h in this run)")
+        cap = int(self.cfg.get("max_sessions") or 0)
+        if cap and self.sessions_this_run >= cap:
+            return f"--max-sessions {cap} reached"
+        return None
 
     # ---- claude sessions -------------------------------------------------------
     def _interrupt(self, proc: subprocess.Popen) -> None:
@@ -614,6 +641,7 @@ class Orchestrator:
     def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=()):
         cfg, st = self.cfg, self.state
         st["session_counter"] = st.get("session_counter", 0) + 1
+        self.sessions_this_run += 1
         base = AD / "logs" / f"{st['session_counter']:03d}-{label}"
         cmd = self.session_command(prompt, model, schema, resume, extra_disallowed)
 
@@ -792,6 +820,10 @@ class Orchestrator:
                 return paused
             unknown = until is None or until < time.time()
             wake = (time.time() + 15 * 60) if unknown else until + RESET_BUFFER_S
+            deadline = self.budget_deadline()
+            if deadline and wake >= deadline:
+                raise StopRequested(f"{reason}, and waiting until ≈{hm(wake)} would run past "
+                                    f"--max-hours {float(self.cfg['max_hours']):g} — stopping instead of sleeping")
             self.state["status"], self.state["resume_at"] = "paused_limit", hm(wake)
             if not paused:
                 self.event("usage", "paused", f"{reason}; sleeping until ≈{hm(wake)}")
@@ -1358,6 +1390,8 @@ class Orchestrator:
     # ---- main loop ---------------------------------------------------------------
     def run(self) -> int:
         st = self.state
+        self.run_started = time.time()
+        st.pop("stop_reason", None)
         self.acquire_lock()
         try:
             self.setup()
@@ -1384,8 +1418,9 @@ class Orchestrator:
             self.notify("autodev 🏁 all phases completed")
             return 0
         except StopRequested as e:
-            st["status"] = "stopped"
+            st["status"], st["stop_reason"] = "stopped", str(e)
             self.event("run", "stopped", str(e))
+            self.notify(f"autodev ⏹ stopped: {one_line(e, 160)}")
             return 130
         except StepFailed as e:
             st["status"], st["error"] = "failed", str(e)
@@ -1429,6 +1464,9 @@ class Orchestrator:
                  f"- **Updated:** {ts()}", ""]
         if st.get("error"):
             lines += [f"> ❌ **Failed:** {one_line(st['error'], 500)}", ""]
+        if st.get("status") == "stopped" and st.get("stop_reason"):
+            lines += [f"> ⏹ **Stopped:** {one_line(st['stop_reason'], 300)} — the same `run` command continues "
+                      "from here.", ""]
         if phases:
             icons = {"pending": "⏳", "in_progress": "🔨", "done": "✅", "failed": "❌"}
             lines += ["## Phases", "", "| # | Phase | User-facing | Status | Commit | Warnings |",
@@ -1558,6 +1596,8 @@ def cmd_status(_args) -> int:
           + (f"  resume≈{st.get('resume_at')}" if st["status"] == "paused_limit" else ""))
     if st.get("error"):
         print("error:", st["error"])
+    if st.get("status") == "stopped" and st.get("stop_reason"):
+        print("stopped:", st["stop_reason"], "— the same `run` continues from here")
     alive = False
     if PID_FILE.exists():
         try:
@@ -1714,6 +1754,10 @@ def main() -> int:
     run.add_argument("--max-test-fix", dest="max_test_fix", type=int)
     run.add_argument("--max-review-rounds", dest="max_review_rounds", type=int)
     run.add_argument("--max-impl-runs", dest="max_impl_runs", type=int)
+    run.add_argument("--max-hours", dest="max_hours", type=float, metavar="H",
+                     help="stop the run after H hours of wall clock (resume with the same command)")
+    run.add_argument("--max-sessions", dest="max_sessions", type=int, metavar="N",
+                     help="stop the run after N sessions started in this run")
     run.add_argument("--session-timeout", dest="session_timeout", type=int, help="minutes per session")
     run.add_argument("--test-timeout", dest="test_timeout", type=int, help="minutes")
     run.add_argument("--poll-interval", dest="poll_interval", type=int, help="seconds")

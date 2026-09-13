@@ -55,6 +55,8 @@ This is the last human input of the run. Everything unasked becomes a logged gue
   things up (an unfamiliar API, a current version), `--mcp-config <file>` for a server this project needs.
 - **A failing commit hook stops the run.** If the repository has hooks the user knows are broken, `--allow-no-verify`
   is the escape; otherwise fixing them before launch is the better answer.
+- **A ceiling on the night** is worth offering: `--max-hours 8` (or `--max-sessions N`) stops the run
+  instead of working through the next usage window. Without one the run goes until the spec is done.
 - Never point the e2e commands at production or at real user data.
 - **GitHub identity.** Commits/pushes use the account from `--gh-user <login>` (pass the same flag to `doctor`).
   If the user didn't pass it and the doctor lists several gh accounts while the repo has a GitHub remote,

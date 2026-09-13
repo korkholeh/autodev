@@ -106,6 +106,7 @@ from then on every session reads that file.
 | `--no-docs`, `--no-finalize` | disable the documentation step / the final session |
 | `--model-plan\|impl\|review\|qa` | models per step (opus / sonnet / opus / sonnet) |
 | `--max-test-fix`, `--max-e2e-fix`, `--max-review-rounds`, `--max-impl-runs` | loop limits |
+| `--max-hours H`, `--max-sessions N` | ceiling on one run — it stops and tells you how to continue (no ceiling by default) |
 | `--gh-user LOGIN` | token via `gh auth token --user LOGIN`; the active gh account is **not switched** |
 | `--push phase\|end\|never` | when to push the `autodev/…` branch (with `--gh-user`, after every phase by default) |
 | `--pr` | draft PR into the base branch, body = the current `PROGRESS.md` (handy to watch from a phone) |
@@ -147,6 +148,13 @@ the next attempt happens after the next phase.
 - the run needs a branch to start from, so a detached HEAD stops it before the first session (`doctor` says so too)
 
 ## Usage limits
+
+**A ceiling on the run is yours to set.** The usage guard below only keeps the subscription happy: it pauses and
+waits, so a long roadmap can keep starting sessions for days. `--max-hours H` and `--max-sessions N` stop the run
+instead — the branch, `PROGRESS.md` and the commits are all there, the reason is written into both, and the same
+`run` command continues from where it stopped (with a fresh budget, which is the point: spending more is your
+decision). A usage pause that would end after the deadline does not happen at all — the run stops rather than
+sleeping into a morning nobody asked for.
 
 Before every session, and every 5 minutes during one, the script reads the 5h/7d utilization. At ≥85% it sends
 SIGINT to the current session, sleeps until the reset (+2 min), then `--resume`s the same session. Sources: the
