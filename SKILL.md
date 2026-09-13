@@ -1,0 +1,77 @@
+---
+name: autodev
+description: Launch a fully autonomous development run from a specification file — a technology-agnostic pipeline that designs the architecture, plans phases, then for every phase plans → implements → tests → reviews → drives end-to-end QA → writes documentation → commits, each step in a separate headless Claude session, auto-pausing near the usage limit. Only when the user explicitly runs /autodev.
+argument-hint: <spec-file> [--profile <stack>] [--gh-user <login>] [--pr] [other autodev.py run flags]
+disable-model-invocation: true
+allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py *) Bash(tmux *) Bash(git status *) Bash(git log *) Bash(git init *) Read
+---
+
+# /autodev — launcher
+
+Arguments: `$ARGUMENTS` (first = spec file, the rest = extra flags for `autodev.py run`).
+
+You are the **launcher**, not the developer. The orchestrator script does the work in separate sessions.
+Never implement the spec yourself in this session.
+
+## 1. Pre-flight (the only moment a human is present)
+
+Run `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py doctor --spec <spec-file>` and resolve issues with the user:
+
+- **FAIL** lines must be fixed before launch (missing spec, git identity, Claude Code not found, a missing toolchain
+  for the detected stack profile).
+- **Existing run** in `.autodev/`: ask whether to resume (default) or start over (`--fresh`).
+- **Usage API unavailable**: tell the user pauses will only trigger on limit events/errors; suggest `AUTODEV_OAUTH_TOKEN`.
+- **Stack profile.** The doctor prints the detected one (`swift-macos`, `swift-ios`, `rust-tui`, `django-htmx`,
+  `django-react`, `fastapi-react`, `generic`). For an empty repository, detection will say `generic` — confirm what is
+  being built and pass `--profile <name>`. The profile only seeds `.autodev/PROFILE.md`; the architect step corrects
+  it against the real repository.
+
+### The intake interview
+
+Read the spec, then follow `${CLAUDE_SKILL_DIR}/prompts/intake.md`: ask **at most 6 questions in one message**, only
+about what the spec does not already answer, each with a recommended default. Write the answers to
+`.autodev/INTAKE.md` and append them to the spec under `## Clarifications (pre-run)`. If the spec answers everything,
+ask nothing and say so.
+
+This is the last human input of the run. Everything unasked becomes a logged guess.
+
+### Commands and GitHub identity
+
+- If the doctor could not guess a test command and the stack is known, suggest `--test-cmd "<cmd>"`.
+- If the end-to-end suite needs services running (a web stack usually does), pass `--e2e-up-cmd`, `--e2e-down-cmd`
+  and optionally `--e2e-ready-url`. The up command runs once per e2e step and must be **idempotent** — starting an
+  already-running surface has to succeed, not fail on a taken port. Left empty, the architect and e2e steps work
+  them out and write them down. `--e2e off` turns the end-to-end layer off entirely.
+- Never point the e2e commands at production or at real user data.
+- **GitHub identity.** Commits/pushes use the account from `--gh-user <login>` (pass the same flag to `doctor`).
+  If the user didn't pass it and the doctor lists several gh accounts while the repo has a GitHub remote,
+  ask which account to use (or "local only"). A `FAIL` on push permission or a missing token must be fixed now
+  (`gh auth login` for that account). Useful extras: `--pr` (draft PR with live PROGRESS.md), `--push end|never`,
+  `--gh-repo owner/name` when there is no GitHub remote, `--git-email` to override the noreply address.
+
+## 2. Launch
+
+Session name: `autodev-<repo-dir-name>`.
+
+If `tmux` is available, start it detached (survives closing the terminal):
+
+```
+tmux new-session -d -s autodev-<repo> -c "$PWD" "python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py run --spec <spec-file> <flags>; exec $SHELL"
+```
+
+Then verify it started: `tmux ls` and, after ~20 s, `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py status`.
+
+If tmux is not available, do **not** background it from this session (it may be killed when Claude Code exits).
+Print the command for the user to run in their own terminal instead:
+`python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py run --spec <spec-file> <flags>`
+
+## 3. Hand-off message (short)
+
+- Watch: `tmux attach -t autodev-<repo>` (detach: Ctrl-b d) · `tail -f .autodev/autodev.log`
+- Status: `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py status`
+- Morning, in this order: `.autodev/HANDOFF.md`, `.autodev/PROGRESS.md`, `.autodev/DECISIONS.md`,
+  `docs/user/`, `git log --oneline` on the `autodev/…` branch (or the draft PR, if `--pr`)
+- Stop gracefully after the current session: `touch .autodev/STOP` · Resume later: same `run` command
+- On macOS: keep the Mac on power with the lid open (caffeinate is on automatically)
+
+Then end your turn.
