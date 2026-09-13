@@ -39,7 +39,7 @@ python3 ~/.claude/skills/autodev/scripts/autodev.py run --spec docs/spec.md
 ```
 architect ─► roadmap ─► for each phase:
    plan ─► implement (×N, while [ ] tasks remain) ─► tests ─┬─► review ─┬─► e2e ─┬─► docs ─► commit + tag
-                                                            │          │        └─► e2e_fix (≤3) ─► e2e
+                                                            │          │        └─► e2e_fix (×≤3) ─► docs
                                                             │          └─► review_fix ─► tests ─► review (round 2)
                                                             └─► test_fix (≤3) ─► tests
                                                                                         ─► finalize (docs + HANDOFF)
@@ -54,6 +54,10 @@ architect ─► roadmap ─► for each phase:
 - **docs** — `CLAUDE.md`, `docs/dev/` (for developers) and `docs/user/` (for users) + `CHANGELOG.md`.
 - **finalize** — reconciles all documentation with what was actually built, and writes `.autodev/HANDOFF.md` —
   the morning briefing.
+
+Each step names the step that follows it, and a phase sent through the suite remembers where it was going. So
+fixing a failing end-to-end case leads on to the documentation rather than back into another review round, and a
+phase that has used up its review rounds still gets its end-to-end QA and its docs.
 
 Tests, e2e, commits, and state are handled by the script (no usage limit spent).
 
@@ -163,3 +167,17 @@ check that they do not block large changes (e.g. PR size limits). Never run e2e 
   `review`, `review_fix`, `e2e`, `e2e_fix`, `docs`, `finalize`) + `intake.md` for the pre-start interview.
 - `guides/` — working rules shared across all stacks (oracles, case taxonomy, debugging, documentation style).
 - `profiles/` — stack profiles. A new stack = one more file modeled on `profiles/generic.md`.
+- `scripts/autodev.py` — the entry point: the phase state machine, the sessions, git and the CLI. A phase step is
+  a method named in `PHASE_STEPS` that does the work and returns the step the phase moves to.
+- `scripts/autodev_lib/` — the parts that stand on their own: `util.py` (paths, logging, git, helpers),
+  `commands.py` (which commands the orchestrator will run), `usage.py` (the limit guard), `github.py`.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests        # from the repository root
+```
+
+Stdlib only, a few seconds, no Claude session and no network: the phase machine runs against stubs, so a change
+to where a phase goes after a step fails a test here instead of surfacing at 3am. The suite also checks that every
+prompt and guide a step reads is shipped, and that no command a profile suggests would be refused.

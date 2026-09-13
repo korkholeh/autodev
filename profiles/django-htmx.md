@@ -28,7 +28,7 @@ template. Business rules live in `services.py`; queries live in `selectors.py`.
 | format | `ruff format .` |
 | e2e up | `python manage.py migrate && python manage.py seed_e2e && python manage.py runserver 8001 &` — or the project's compose file |
 | e2e | `pytest e2e -q` (pytest-playwright) |
-| e2e down | stop the server started by `e2e up` |
+| e2e down | stop the server the e2e up command started |
 
 Add `makemigrations --check --dry-run` to the lint step: a model change with no migration must fail the build.
 

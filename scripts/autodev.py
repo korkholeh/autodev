@@ -33,17 +33,19 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-SKILL_DIR = Path(__file__).resolve().parent.parent
-PROMPTS_DIR = SKILL_DIR / "prompts"
-GUIDES_DIR = SKILL_DIR / "guides"
-PROFILES_DIR = SKILL_DIR / "profiles"
-AD = Path(".autodev")
-STATE_FILE = AD / "state.json"
-STOP_FILE = AD / "STOP"
-PID_FILE = AD / "run.pid"
-SURFACE_LOG = AD / "logs" / "e2e-surfaces.log"
-USAGE_ENDPOINT = os.environ.get("AUTODEV_USAGE_ENDPOINT", "https://api.anthropic.com/api/oauth/usage")
-RESET_BUFFER_S = int(os.environ.get("AUTODEV_RESET_BUFFER", "120"))
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:              # so autodev_lib imports whether run or imported
+    sys.path.insert(0, str(_HERE))
+
+from autodev_lib.commands import CMD_CORRECTION, CMD_FIELDS, command_allowed  # noqa: E402
+from autodev_lib.github import GitHub  # noqa: E402
+from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
+from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
+                              STOP_FILE, SURFACE_LOG, StepFailed, StopRequested, atomic_write,
+                              available_profiles, bullets, child_env, claude_version, detect_profile,
+                              extract_json, git, hm, log, one_line, render, set_log_path, slugify,
+                              ts, unchecked_tasks)
+
 PERMISSION_PROMPTS_MIN = (2, 1, 259)  # first version with --permission-prompts none
 BLOCKING = {"blocker", "major"}
 
@@ -89,10 +91,6 @@ DEFAULTS = {
     "push": "auto",       # phase | end | never; auto = phase when gh_user is set, else never
     "pr": False,          # create/update a draft PR (requires gh_user)
 }
-
-# git credential helper that answers only for this push, from env vars (token never hits argv or disk)
-PUSH_HELPER = ('!f() { test "$1" = get || exit 0; echo "username=${AUTODEV_GH_LOGIN}"; '
-               'echo "password=${AUTODEV_GH_TOKEN}"; }; f')
 
 ARCH_SCHEMA = {
     "type": "object",
@@ -190,456 +188,37 @@ NUDGE = ("Autonomous mode: no human is available. If you asked a question or off
          "step to completion. Then return the required structured output.")
 
 
-class StepFailed(Exception):
-    pass
-
-
-class StopRequested(Exception):
-    pass
-
-
-# ----------------------------------------------------------------------------- utils
-_log_path: Path | None = None
-
-
-def ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def hm(epoch) -> str:
-    return datetime.fromtimestamp(epoch).strftime("%d.%m %H:%M") if epoch else "?"
-
-
-def log(msg: str) -> None:
-    line = f"[{ts()}] {msg}"
-    print(line, flush=True)
-    if _log_path:
-        with open(_log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
-
-def atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def git(*args, check=True) -> str:
-    r = subprocess.run(["git", *args], capture_output=True, text=True)
-    if check and r.returncode != 0:
-        raise StepFailed(f"git {' '.join(args)} failed: {r.stderr.strip()}")
-    return r.stdout.strip()
-
-
-def to_epoch(v):
-    if v in (None, ""):
-        return None
-    if isinstance(v, (int, float)):
-        return v / 1000 if v > 1e12 else float(v)
-    try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
-def slugify(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:40] or "phase"
-
-
-def one_line(s: str, limit=300) -> str:
-    s = re.sub(r"\s+", " ", str(s or "")).strip()
-    return s if len(s) <= limit else s[: limit - 1] + "…"
-
-
-def bullets(items) -> str:
-    return "\n".join(f"- {x}" for x in (items or [])) or "- (none)"
-
-
-# --------------------------------------------------------------- commands proposed by a session
-# The orchestrator runs the test and e2e commands itself, with a shell and the developer's full
-# environment, outside the permission classifier that guards a session's own Bash calls. Sessions
-# propose those commands, and a session's input (the spec, a README, a page it fetched) is not
-# trusted. So a proposed command has to look like a toolchain invocation: every segment starts with
-# a known build/test binary, and nothing in it fetches or evaluates code. A command the developer
-# passed on the command line is used as typed and never checked here.
-CMD_ALLOWLIST = {
-    "cd", "true", "echo", "sleep", "wait-on", "wait-for-it",
-    "make", "just", "task", "mise", "nox", "tox", "hatch", "invoke", "set",
-    "python", "python3", "py", "pytest", "coverage", "uv", "uvx", "pip", "pip3", "poetry",
-    "pipenv", "pdm", "manage.py", "django-admin", "alembic", "ruff", "mypy", "black", "flake8",
-    "pylint", "isort", "bandit",
-    "node", "npm", "npx", "pnpm", "yarn", "bun", "bunx", "deno", "vitest", "jest", "mocha",
-    "playwright", "cypress", "eslint", "prettier", "tsc", "vite", "turbo", "nx", "lerna", "rush",
-    "cargo", "rustup", "rustc",
-    "go", "gotestsum", "golangci-lint",
-    "swift", "xcodebuild", "xcrun", "fastlane", "swiftlint", "swiftformat", "xcpretty", "xcbeautify",
-    "dotnet", "mvn", "mvnw", "gradle", "gradlew", "mix", "rake", "bundle", "rspec", "rubocop",
-    "composer", "phpunit", "php", "artisan",
-    "cmake", "ctest", "ninja", "meson", "bazel", "buck2", "scons", "bear",
-    "sbt", "lein", "clojure", "clj", "stack", "cabal",
-    "flutter", "dart", "zig", "nim", "crystal", "elm", "tee",
-    "docker", "docker-compose", "podman", "podman-compose",
-}
-CMD_WRAPPERS = {"env", "nohup", "time", "timeout", "stdbuf", "xvfb-run", "caffeinate"}
-CMD_FORBIDDEN = (
-    (re.compile(r"\$\(|`"), "command substitution"),
-    (re.compile(r"\b(sudo|doas)\b"), "privilege escalation"),
-    (re.compile(r"\b(curl|wget|ssh|scp|rsync)\b"), "network transfer"),
-    (re.compile(r"\beval\b"), "eval"),
-    (re.compile(r"\brm\b\s+-\w*[rf]"), "recursive or forced delete"),
-    (re.compile(r"\b(sh|bash|zsh|ksh|fish|python3?|node|deno|perl|ruby|php|Rscript)\b\s+-[ce]\b"),
-     "inline script"),
-    (re.compile(r"\btee\b\s+(-\S+\s+)*(~|/(?!dev/null\b))"), "writing outside the repository"),
-    (re.compile(r">>?\s*(~|/(?!dev/null\b))"), "redirection outside the repository"),
-    (re.compile(r"\b(chmod|chown|killall|launchctl|crontab|systemctl)\b"), "system modification"),
-)
-CMD_MAX_LEN = 400
-
-
-def command_head(segment: str):
-    """The binary a shell segment starts with, ignoring env assignments and wrappers."""
-    toks = segment.strip().split()
-    while toks:
-        raw = toks[0].strip("\'\"")
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", raw):     # CI=1 npm test
-            toks.pop(0)
-            continue
-        name = Path(raw).name if "/" in raw else raw            # .venv/bin/pytest -> pytest
-        if name in CMD_WRAPPERS or raw.startswith("-") or re.fullmatch(r"[\d.]+[smh]?", raw):
-            toks.pop(0)
-            continue
-        return name
-    return None
-
-
-def command_allowed(cmd: str, extra=()) -> tuple:
-    """(ok, reason) for a command a session proposed. See the note above CMD_ALLOWLIST."""
-    cmd = (cmd or "").strip()
-    if not cmd:
-        return False, "empty"
-    if len(cmd) > CMD_MAX_LEN:
-        return False, f"longer than {CMD_MAX_LEN} characters"
-    for pat, why in CMD_FORBIDDEN:
-        if pat.search(cmd):
-            return False, why
-    allowed = CMD_ALLOWLIST | {str(x).strip() for x in (extra or ()) if str(x).strip()}
-    for segment in re.split(r"&&|\|\||;|\||&", cmd):
-        head = command_head(segment)
-        if head is not None and head not in allowed:
-            return False, f"`{head}` is not a known build or test command"
-    return True, ""
-
-
-CMD_FIELDS = {  # structured-output field -> the run flag that overrides it (empty: no flag)
-    "test_command": "test_cmd", "lint_command": "", "e2e_command": "e2e_cmd",
-    "e2e_up_command": "e2e_up_cmd", "e2e_down_command": "e2e_down_cmd",
-}
-CMD_CORRECTION = """The orchestrator will not run the command(s) you returned, so this step is not finished yet:
-
-{{problems}}
-
-It runs these itself, outside the permission classifier that checks your own Bash calls, so it only
-accepts a plain toolchain invocation: every segment has to start with a known build or test binary
-(make, uv, python, pytest, npm, npx, cargo, swift, xcodebuild, go, gradle, cmake, docker, ...),
-optionally chained with &&, and nothing may fetch or evaluate code, use sudo, or redirect outside
-the repository.
-
-Give the project a command of that shape instead of working around it: add the target to the
-Makefile, the script entry to package.json, or the equivalent for this stack, and commit that file
-as part of your work. Run the command to be sure it works, then return the corrected commands in the
-same structured output. Use `-` for a command that is genuinely not needed."""
-
-
-def render(name: str, **kw) -> str:
-    text = (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
-    for k, v in kw.items():
-        text = text.replace("{{" + k + "}}", str(v))
-    return text
-
-
-def child_env() -> dict:
-    """Environment for child processes: drop markers of an enclosing Claude Code session,
-    otherwise nested `claude` may refuse to start when launched from inside Claude Code."""
-    env = dict(os.environ)
-    for k in list(env):
-        if k == "CLAUDECODE" or k == "CLAUDE_CODE_ENTRYPOINT":
-            env.pop(k)
-    return env
-
-
-def claude_version(binary: str):
-    try:
-        out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=60,
-                             env=child_env()).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
-    return tuple(int(x) for x in m.groups()) if m else None
-
-
-def extract_json(result_ev: dict | None, required_key: str):
-    if not result_ev:
-        return None
-    so = result_ev.get("structured_output")
-    if isinstance(so, dict) and required_key in so:
-        return so
-    text = result_ev.get("result") or ""
-    dec = json.JSONDecoder()
-    found = None
-    for i, ch in enumerate(text):
-        if ch != "{":
-            continue
-        try:
-            obj, _ = dec.raw_decode(text[i:])
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and required_key in obj:
-            found = obj  # keep the last matching object
-    return found
-
-
-def unchecked_tasks(plan: Path) -> int:
-    if not plan.exists():
-        return 0
-    return len(re.findall(r"^\s*[-*]\s+\[ \]", plan.read_text(encoding="utf-8"), re.M))
-
-
-def detect_profile() -> str:
-    """Guess a stack profile from the files in the working directory (shallow — no deep tree walks)."""
-    def read(*names) -> str:
-        out = []
-        for n in names:
-            for f in Path(".").glob(n):
-                if f.is_file():
-                    out.append(f.read_text(errors="ignore")[:20000])
-        return " ".join(out)
-
-    if Path("Package.swift").exists() or list(Path(".").glob("*.xcodeproj")) or list(Path(".").glob("*.xcworkspace")):
-        swift = read("Package.swift", "*.xcodeproj/project.pbxproj", "*/Info.plist")
-        return "swift-ios" if ("IPHONEOS_DEPLOYMENT_TARGET" in swift or "platform=iOS" in swift
-                               or ".iOS(" in swift) else "swift-macos"
-    if Path("Cargo.toml").exists():
-        cargo = read("Cargo.toml", "*/Cargo.toml")
-        return "rust-tui" if any(k in cargo for k in ("ratatui", "crossterm", "cursive", "termion")) else "generic"
-    if Path("manage.py").exists() or list(Path(".").glob("*/manage.py")):
-        spa = Path("frontend").exists() or Path("package.json").exists()
-        return "django-react" if spa else "django-htmx"
-    py = read("pyproject.toml", "requirements*.txt", "requirements*.in", "*/pyproject.toml", "*/requirements*.txt")
-    if "fastapi" in py.lower():
-        return "fastapi-react"
-    return "generic"
-
-
-def available_profiles() -> list[str]:
-    return sorted(f.stem for f in PROFILES_DIR.glob("*.md") if f.stem != "README")
-
-
-# ----------------------------------------------------------------------------- usage guard
-class UsageGuard:
-    """Tracks 5h / 7d utilization from the (undocumented) OAuth usage endpoint and from
-    `rate_limit_event`s in the stream. Values are percentages 0..100."""
-
-    def __init__(self, threshold: float, weekly_threshold: float):
-        self.threshold = threshold
-        self.weekly_threshold = weekly_threshold
-        self.five = self.five_reset = self.week = self.week_reset = None
-        self.rejected = False
-        self.rejected_reset = None
-        self.api_ok = None
-        self._last = 0.0
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def token():
-        if os.environ.get("AUTODEV_OAUTH_TOKEN"):
-            return os.environ["AUTODEV_OAUTH_TOKEN"]
-        blobs = []
-        cfg_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-        cred = cfg_dir / ".credentials.json"
-        if cred.exists():
-            blobs.append(cred.read_text(encoding="utf-8", errors="ignore"))
-        if sys.platform == "darwin" and shutil.which("security"):
-            service = os.environ.get("AUTODEV_KEYCHAIN_SERVICE", "Claude Code-credentials")
-            r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
-                               capture_output=True, text=True)
-            if r.returncode == 0:
-                blobs.append(r.stdout)
-        for b in blobs:
-            try:
-                tok = (json.loads(b).get("claudeAiOauth") or {}).get("accessToken")
-            except (ValueError, AttributeError):
-                continue
-            if tok:
-                return tok
-        return None
-
-    def refresh(self, force=False) -> None:
-        if not force and time.time() - self._last < 90:
-            return
-        self._last = time.time()
-        tok = self.token()
-        if not tok:
-            if self.api_ok is None:
-                log("WARN usage API: OAuth token not found (set AUTODEV_OAUTH_TOKEN). "
-                    "Falling back to stream rate-limit events and limit errors.")
-            self.api_ok = False
-            return
-        req = urllib.request.Request(USAGE_ENDPOINT, headers={
-            "Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20",
-            "Accept": "application/json", "User-Agent": "autodev/1.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                data = json.load(r)
-        except Exception as e:  # noqa: BLE001
-            if self.api_ok is not False:
-                log(f"WARN usage API unavailable ({e}); falling back to stream events / limit errors")
-            self.api_ok = False
-            return
-        self.api_ok = True
-        with self._lock:
-            fh, sd = data.get("five_hour") or {}, data.get("seven_day") or {}
-            self.five = float(fh.get("utilization") or 0)
-            self.five_reset = to_epoch(fh.get("resets_at"))
-            self.week = float(sd.get("utilization") or 0)
-            self.week_reset = to_epoch(sd.get("resets_at"))
-            self.rejected = False
-
-    def observe(self, info: dict) -> None:
-        with self._lock:
-            kind = info.get("rateLimitType") or info.get("rate_limit_type")
-            util = info.get("utilization")
-            pct = None if util is None else (float(util) * 100 if float(util) <= 1.0 else float(util))
-            reset = to_epoch(info.get("resetsAt") or info.get("resets_at"))
-            if kind in (None, "five_hour"):
-                if pct is not None:
-                    self.five = pct
-                if reset:
-                    self.five_reset = reset
-            elif str(kind).startswith("seven_day"):
-                if pct is not None:
-                    self.week = max(self.week or 0, pct)
-                if reset:
-                    self.week_reset = reset
-            if info.get("status") == "rejected":
-                self.rejected = True
-                self.rejected_reset = reset
-
-    def over(self):
-        now = time.time()
-        with self._lock:
-            if self.five_reset and now > self.five_reset + RESET_BUFFER_S:
-                self.five, self.five_reset = None, None
-            if self.week_reset and now > self.week_reset + RESET_BUFFER_S:
-                self.week, self.week_reset = None, None
-            if self.rejected_reset and now > self.rejected_reset + RESET_BUFFER_S:
-                self.rejected, self.rejected_reset = False, None
-            if self.rejected:
-                return True, "usage limit reached", self.rejected_reset or self.five_reset
-            if self.week is not None and self.week >= self.weekly_threshold:
-                return True, f"weekly usage {self.week:.0f}% ≥ {self.weekly_threshold:.0f}%", self.week_reset
-            if self.five is not None and self.five >= self.threshold:
-                return True, f"5h usage {self.five:.0f}% ≥ {self.threshold:.0f}%", self.five_reset
-        return False, "", None
-
-    def forget_event_values(self) -> None:
-        with self._lock:
-            if self.api_ok is not True:
-                self.five = self.week = None
-            self.rejected, self.rejected_reset = False, None
-
-    def describe(self) -> str:
-        f = f"{self.five:.0f}%" if self.five is not None else "?"
-        w = f"{self.week:.0f}%" if self.week is not None else "?"
-        return f"5h {f} (reset {hm(self.five_reset)}) · 7d {w}"
-
-
-# ----------------------------------------------------------------------------- GitHub
-class GitHub:
-    """Acts as one explicit gh account without touching gh's active-account config:
-    token from `gh auth token --user`, GH_TOKEN for gh calls, a one-shot credential helper for git push."""
-
-    def __init__(self, user: str, host: str = "github.com", repo_override: str = "", remote: str = "origin"):
-        self.user, self.host, self.repo_override, self.remote = user, host, repo_override.strip(), remote
-        self.token = self.login = self.name = self.email = self.repo = None
-        self.repo_from_remote = False
-        self.can_push = False
-
-    def _env(self) -> dict:
-        env = dict(os.environ)
-        env.pop("GITHUB_TOKEN", None)
-        env["GH_PROMPT_DISABLED"] = "1"
-        if self.host == "github.com":
-            env["GH_TOKEN"] = self.token
-        else:
-            env["GH_HOST"], env["GH_ENTERPRISE_TOKEN"] = self.host, self.token
-        return env
-
-    def gh(self, *args, check=True) -> str:
-        r = subprocess.run(["gh", *args], capture_output=True, text=True, env=self._env(), timeout=180)
-        if check and r.returncode != 0:
-            raise RuntimeError(f"gh {' '.join(args[:2])} failed: {one_line(r.stderr or r.stdout, 300)}")
-        return r.stdout.strip()
-
-    def connect(self) -> "GitHub":
-        if not shutil.which("gh"):
-            raise RuntimeError("gh CLI not found (brew install gh)")
-        r = subprocess.run(["gh", "auth", "token", "--hostname", self.host, "--user", self.user],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode != 0 or not r.stdout.strip():
-            raise RuntimeError(f"gh has no token for account '{self.user}' on {self.host} — log in once with "
-                               f"`gh auth login --hostname {self.host}` ({one_line(r.stderr, 160)})")
-        self.token = r.stdout.strip()
-        me = json.loads(self.gh("api", "user"))
-        self.login = me["login"]
-        if self.login.lower() != self.user.lower():
-            raise RuntimeError(f"token for '{self.user}' belongs to '{self.login}'")
-        self.name = me.get("name") or self.login
-        self.email = (f"{me['id']}+{self.login}@users.noreply.github.com" if self.host == "github.com"
-                      else (me.get("email") or ""))
-        return self
-
-    def resolve_repo(self):
-        if self.repo_override:
-            self.repo = re.sub(r"\.git$", "", self.repo_override)
-        else:
-            url = git("remote", "get-url", self.remote, check=False)
-            m = re.search(r"(?:^https?://(?:[^@/]+@)?|^ssh://git@|^git@)" + re.escape(self.host)
-                          + r"[:/]([^/]+/[^/]+?)(?:\.git)?/?$", url)
-            self.repo = m.group(1) if m else None
-            self.repo_from_remote = bool(m)
-        if self.repo:
-            self.can_push = self.gh("api", f"repos/{self.repo}", "--jq", ".permissions.push", check=False) == "true"
-        return self.repo
-
-    def push(self, branch: str) -> None:
-        env = {**os.environ, "AUTODEV_GH_LOGIN": self.login, "AUTODEV_GH_TOKEN": self.token,
-               "GIT_TERMINAL_PROMPT": "0"}
-        cmd = ["git", "-c", "credential.helper=", "-c", f"credential.https://{self.host}.helper=",
-               "-c", f"credential.helper={PUSH_HELPER}",
-               "push", f"https://{self.host}/{self.repo}.git", f"HEAD:refs/heads/{branch}"]
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
-        if r.returncode != 0:
-            raise RuntimeError(one_line(r.stderr or r.stdout, 400))
-        if self.repo_from_remote:  # keep `git status` / upstream tracking sane locally
-            git("update-ref", f"refs/remotes/{self.remote}/{branch}", "HEAD", check=False)
-            git("config", f"branch.{branch}.remote", self.remote, check=False)
-            git("config", f"branch.{branch}.merge", f"refs/heads/{branch}", check=False)
-
-    def sync_pr(self, branch: str, base: str, title: str, body_md: str) -> str:
-        body_file = AD / "logs" / "pr_body.md"
-        atomic_write(body_file, body_md[:60000])
-        url = self.gh("pr", "list", "--repo", self.repo, "--head", branch, "--state", "open",
-                      "--json", "url", "--jq", '.[0].url // ""')
-        if url:
-            self.gh("pr", "edit", url, "--repo", self.repo, "--body-file", str(body_file))
-            return url
-        out = self.gh("pr", "create", "--repo", self.repo, "--head", branch, "--base", base, "--draft",
-                      "--title", title, "--body-file", str(body_file))
-        return out.splitlines()[-1] if out else ""
-
-
 # ----------------------------------------------------------------------------- orchestrator
+PHASE_STEPS = {         # phase step -> the Orchestrator method that runs it and names the next step
+    "plan": "_plan", "implement": "_implement", "test": "_test", "test_fix": "_test_fix",
+    "review": "_review", "review_fix": "_review_fix", "e2e": "_e2e", "e2e_fix": "_e2e_fix",
+    "docs": "_docs", "commit": "_commit",
+}
+
+
+class PhaseRun:
+    """Everything a phase step works with, assembled once per step."""
+
+    def __init__(self, orch: "Orchestrator", i: int):
+        st, proj = orch.state, orch.state["project"]
+        self.i, self.n, self.total = i, i + 1, len(st["phases"])
+        self.ph = st["phases"][i]
+        self.ctx = st.setdefault("phase_ctx", {})
+        self.step = st["step"]
+        self.label = f"p{self.n:02d}-{self.step}"
+        self.dir = orch.phase_dir(i)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.common = dict(
+            n=self.n, total=self.total, title=self.ph["title"], goal=self.ph["goal"],
+            deliverables=bullets(self.ph["deliverables"]), acceptance=bullets(self.ph["acceptance_criteria"]),
+            spec=st["spec"], phase_dir=self.dir.as_posix(), lang=orch.cfg["lang"],
+            test_command=proj.get("test_command") or "(none configured)",
+            e2e_command=orch.e2e_command() or "(not created yet — build the harness)",
+            e2e_up_command=proj.get("e2e_up_command") or "(nothing to start)",
+            base_sha=self.ctx.get("base_sha", ""),
+            user_facing="yes" if self.ph.get("user_facing", True) else "no")
+
+
 class Orchestrator:
     def __init__(self, state: dict):
         self.state = state
@@ -749,9 +328,8 @@ class Orchestrator:
         PID_FILE.write_text(str(os.getpid()))
 
     def setup(self) -> None:
-        global _log_path
         (AD / "logs").mkdir(parents=True, exist_ok=True)
-        _log_path = AD / "autodev.log"
+        set_log_path(AD / "autodev.log")
 
         gi = AD / ".gitignore"
         if not gi.exists():
@@ -1328,206 +906,226 @@ class Orchestrator:
         self.publish()
         self.require_test_command("the roadmap step")
 
+    # ---- one phase, step by step ---------------------------------------------------
     def step_phase(self) -> None:
-        st, cfg = self.state, self.cfg
-        i = st["phase_index"]
-        ph, n, total = st["phases"][i], i + 1, len(st["phases"])
-        ctx = st.setdefault("phase_ctx", {})
-        pdir = self.phase_dir(i)
-        pdir.mkdir(parents=True, exist_ok=True)
-        proj = st["project"]
-        common = dict(n=n, total=total, title=ph["title"], goal=ph["goal"], deliverables=bullets(ph["deliverables"]),
-                      acceptance=bullets(ph["acceptance_criteria"]), spec=st["spec"], phase_dir=pdir.as_posix(),
-                      test_command=proj.get("test_command") or "(none configured)", lang=cfg["lang"],
-                      e2e_command=self.e2e_command() or "(not created yet — build the harness)",
-                      e2e_up_command=proj.get("e2e_up_command") or "(nothing to start)",
-                      base_sha=ctx.get("base_sha", ""), user_facing="yes" if ph.get("user_facing", True) else "no")
-        step = st["step"]
-        label = f"p{n:02d}-{step}"
+        """Run the current phase step and move the phase where that step says to go.
 
-        if step == "plan":
-            if not ctx.get("base_sha"):
-                ctx.update(base_sha=git("rev-parse", "HEAD"), impl_runs=0, test_fix_attempts=0,
-                           review_round=0, warnings=[])
-            ph["status"] = "in_progress"
-            res = self.session(label, render("plan", **common), cfg["model_plan"], STEP_SCHEMA, "status",
-                               recheck=lambda d: self.command_complaint(d, ("test_command",)))
-            if res["status"] == "blocked":
-                raise StepFailed(f"phase {n} plan blocked: {res.get('summary')}")
-            if not (pdir / "PLAN.md").exists():
-                raise StepFailed(f"phase {n}: PLAN.md was not created")
-            if not cfg["test_cmd"]:
-                st["project"]["test_command"] = self.vet_command(
-                    "test_command", res.get("test_command") or "", st["project"].get("test_command", ""))
-            self.set_step("implement")
-
-        elif step == "implement":
-            ctx["impl_runs"] += 1
-            res = self.session(label, render("implement", run=ctx["impl_runs"], **common),
-                               cfg["model_impl"], STEP_SCHEMA, "status")
-            if res["status"] == "blocked":
-                raise StepFailed(f"phase {n} implementation blocked: {res.get('summary')}")
-            left = unchecked_tasks(pdir / "PLAN.md")
-            if (res["status"] == "partial" or left) and ctx["impl_runs"] < cfg["max_impl_runs"]:
-                log(f"phase {n}: {left} task(s) left — continuing in a fresh session")
-                self.set_step("implement")
-            else:
-                if left:
-                    ctx["warnings"].append(f"{left} PLAN.md task(s) left unchecked")
-                self.set_step("test")
-
-        elif step == "test":
-            if not (proj.get("test_command") or "").strip():
-                ctx["warnings"].append("no test command configured — the unit suite never ran")
-            ok, summary = self.run_tests(pdir)
-            self.event(f"p{n:02d}-tests", "pass" if ok else "fail", summary)
-            if ok:
-                # out of review rounds is not a reason to skip end-to-end QA and the documentation
-                self.set_step("review" if ctx["review_round"] < cfg["max_review_rounds"]
-                              else self.after_review(ph))
-            elif ctx["test_fix_attempts"] >= cfg["max_test_fix"]:
-                raise StepFailed(f"phase {n}: tests still failing after {ctx['test_fix_attempts']} fix attempts "
-                                 f"(see {pdir.as_posix()}/TEST_OUTPUT.txt)")
-            else:
-                self.set_step("test_fix")
-
-        elif step == "test_fix":
-            ctx["test_fix_attempts"] += 1
-            res = self.session(f"{label}{ctx['test_fix_attempts']}",
-                               render("test_fix", attempt=ctx["test_fix_attempts"], max=cfg["max_test_fix"], **common),
-                               cfg["model_impl"], STEP_SCHEMA, "status")
-            if res["status"] == "blocked":
-                raise StepFailed(f"phase {n} test fix blocked: {res.get('summary')}")
-            self.set_step("test")
-
-        elif step == "review":
-            ctx["review_round"] += 1
-            r = ctx["review_round"]
-            git("add", "-A")  # so `git diff <base>` also shows new files
-            prev = (f"- Previous review: `{pdir.as_posix()}/REVIEW-r{r - 1}.md` — check its blocker/major "
-                    "findings were really fixed." if r > 1 else "")
-            res = self.session(f"{label}{r}", render("review", round=r, previous_review=prev, **common),
-                               cfg["model_review"], REVIEW_SCHEMA, "verdict",
-                               extra_disallowed=("Edit", "Write", "NotebookEdit"))
-            if "verdict" not in res:
-                ctx["warnings"].append(f"review round {r} did not complete")
-                self.set_step(self.after_review(ph))
-                return
-            findings = res.get("findings") or []
-            md = [f"# Review — phase {n} round {r}", "", f"**Verdict:** {res['verdict']}", "", res.get("summary", ""), ""]
-            for f in findings:
-                md += [f"## [{f.get('severity', '?').upper()}] {f.get('title', '')}",
-                       f"`{f.get('file', '')}`" if f.get("file") else "", "", f.get("detail", ""), ""]
-                if f.get("suggested_fix"):
-                    md += [f"**Fix:** {f['suggested_fix']}", ""]
-            atomic_write(pdir / f"REVIEW-r{r}.md", "\n".join(md))
-            blocking = [f for f in findings if f.get("severity") in BLOCKING]
-            self.set_step("review_fix" if blocking else self.after_review(ph))
-
-        elif step == "review_fix":
-            r = ctx["review_round"]
-            res = self.session(f"{label}{r}", render("review_fix", round=r, **common),
-                               cfg["model_impl"], STEP_SCHEMA, "status")
-            if res["status"] == "blocked":
-                ctx["warnings"].append(f"review fixes round {r} blocked: {one_line(res.get('summary'), 120)}")
-            if r >= cfg["max_review_rounds"]:
-                ctx["warnings"].append(f"review round {r} had blocker/major findings; fixes applied, not re-reviewed")
-            ctx["test_fix_attempts"] = 0
-            self.set_step("test")
-
-        elif step == "e2e":
-            ctx["e2e_runs"] = ctx.get("e2e_runs", 0) + 1
-            started = self.surfaces_up()
-            try:
-                if not started:
-                    ctx["warnings"].append("e2e skipped: the surfaces could not be started")
-                    log("WARN e2e surfaces did not start — skipping the e2e step for this phase")
-                    self.set_step(self.after_e2e())
-                    return
-                res = self.session(label, render("e2e", **common), cfg["model_qa"], E2E_SCHEMA, "status",
-                                   recheck=lambda d: self.command_complaint(
-                                       d, ("e2e_command", "e2e_up_command", "e2e_down_command")))
-                for key, cfg_key in (("e2e_command", "e2e_cmd"), ("e2e_up_command", "e2e_up_cmd"),
-                                     ("e2e_down_command", "e2e_down_cmd")):
-                    if not cfg.get(cfg_key):
-                        st["project"][key] = self.vet_command(key, res.get(key) or "",
-                                                              st["project"].get(key, ""))
-                if res["status"] == "blocked":
-                    ctx["warnings"].append(f"e2e blocked: {one_line(res.get('summary'), 160)}")
-                    self.set_step(self.after_e2e())
-                    return
-                if not self.e2e_command():
-                    ctx["warnings"].append("no e2e command configured — the end-to-end suite never ran")
-                ok, summary = self.run_e2e(pdir)
-                self.event(f"p{n:02d}-e2e", "pass" if ok else "fail", summary)
-                if ok:
-                    self.set_step(self.after_e2e())
-                elif ctx.get("e2e_fix_attempts", 0) >= cfg["max_e2e_fix"]:
-                    ctx["warnings"].append(f"e2e still failing after {cfg['max_e2e_fix']} fix attempts "
-                                           f"({summary}) — see {pdir.as_posix()}/E2E_OUTPUT.txt")
-                    self.set_step(self.after_e2e())
-                else:
-                    self.set_step("e2e_fix")
-            finally:
-                if started and st["step"] not in ("e2e_fix", "e2e"):
-                    self.surfaces_down()
-
-        elif step == "e2e_fix":
-            ctx["e2e_fix_attempts"] = ctx.get("e2e_fix_attempts", 0) + 1
-            started = self.surfaces_up()
-            try:
-                if not started:
-                    ctx["warnings"].append("e2e fix skipped: the surfaces could not be started")
-                    self.set_step(self.after_e2e())
-                    return
-                res = self.session(f"{label}{ctx['e2e_fix_attempts']}",
-                                   render("e2e_fix", attempt=ctx["e2e_fix_attempts"], max=cfg["max_e2e_fix"],
-                                          **common), cfg["model_impl"], STEP_SCHEMA, "status")
-                if res["status"] == "blocked":
-                    ctx["warnings"].append(f"e2e fix blocked: {one_line(res.get('summary'), 160)}")
-                    self.set_step(self.after_e2e())
-                    return
-                ok, summary = self.run_e2e(pdir)
-                self.event(f"p{n:02d}-e2e", "pass" if ok else "fail", summary)
-                if ok:
-                    self.set_step(self.after_e2e())
-                elif ctx["e2e_fix_attempts"] >= cfg["max_e2e_fix"]:
-                    ctx["warnings"].append(f"e2e still failing after {cfg['max_e2e_fix']} fix attempts ({summary})")
-                    self.set_step(self.after_e2e())
-                else:
-                    self.set_step("e2e_fix")
-            finally:
-                if started and st["step"] != "e2e_fix":
-                    self.surfaces_down()
-            # the unit suite must still be green after e2e-driven product fixes
-            if st["step"] == "docs" or st["step"] == "commit":
-                ok, summary = self.run_tests(pdir)
-                self.event(f"p{n:02d}-tests", "pass" if ok else "fail", summary + " (after e2e fixes)")
-                if not ok:
-                    ctx["test_fix_attempts"] = 0
-                    self.set_step("test_fix")
-
-        elif step == "docs":
-            res = self.session(label, render("docs", **common), cfg["model_impl"], STEP_SCHEMA, "status")
-            if res["status"] == "blocked":
-                ctx["warnings"].append(f"docs blocked: {one_line(res.get('summary'), 160)}")
-            self.set_step("commit")
-
-        elif step == "commit":
-            body = [f"Phase {n}/{total}: {ph['goal']}", "", f"Plan & reviews: {pdir.as_posix()}/"]
-            if ctx.get("warnings"):
-                body += ["", "Warnings:"] + [f"- {w}" for w in ctx["warnings"]]
-            sha = self.commit(f"autodev: phase {n:02d} — {ph['title']}", "\n".join(body))
-            if sha:
-                git("tag", "-f", f"{st['branch']}/phase-{n:02d}", check=False)
-            ph.update(status="done", commit=sha, warnings=ctx.get("warnings", []), finished=ts())
-            self.event(f"p{n:02d}-commit", "done", sha or "no changes to commit")
-            self.notify(f"autodev ✅ phase {n}/{total}: {ph['title']}")
-            st["phase_index"], st["phase_ctx"] = i + 1, {}
-            self.set_step("plan")
+        Each handler returns the next step, so a phase's routing is one readable line per
+        outcome instead of a branch that has to re-derive where the phase was headed."""
+        st = self.state
+        run = PhaseRun(self, st["phase_index"])
+        handler = PHASE_STEPS.get(st["step"])
+        if handler is None:
+            raise StepFailed(f"unknown step {st['step']}")
+        before = st["phase_index"]
+        nxt = getattr(self, handler)(run)
+        if nxt:
+            self.set_step(nxt)
+        if st["phase_index"] != before:         # the phase finished and the next one starts
             self.publish()
-        else:
-            raise StepFailed(f"unknown step {step}")
+
+    def to_tests(self, run: "PhaseRun", after: str) -> str:
+        """Send the phase through the suite, remembering where it was going.
+
+        The test step is reached from the implementation, from review fixes and from e2e fixes.
+        Without a remembered target it has to guess, and a phase coming back from end-to-end
+        fixes gets sent into another review round instead of on to its documentation."""
+        run.ctx["after_tests"] = after
+        return "test"
+
+    def next_review(self, run: "PhaseRun") -> str:
+        """The review round this phase still owes, or where it goes now reviews are done."""
+        if run.ctx.get("review_round", 0) < self.cfg["max_review_rounds"]:
+            return "review"
+        return self.after_review(run.ph)
+
+    def _plan(self, run: "PhaseRun") -> str:
+        cfg, st = self.cfg, self.state
+        if not run.ctx.get("base_sha"):
+            run.ctx.update(base_sha=git("rev-parse", "HEAD"), impl_runs=0, test_fix_attempts=0,
+                           review_round=0, warnings=[])
+        run.ph["status"] = "in_progress"
+        res = self.session(run.label, render("plan", **run.common), cfg["model_plan"], STEP_SCHEMA, "status",
+                           recheck=lambda d: self.command_complaint(d, ("test_command",)))
+        if res["status"] == "blocked":
+            raise StepFailed(f"phase {run.n} plan blocked: {res.get('summary')}")
+        if not (run.dir / "PLAN.md").exists():
+            raise StepFailed(f"phase {run.n}: PLAN.md was not created")
+        if not cfg["test_cmd"]:
+            st["project"]["test_command"] = self.vet_command(
+                "test_command", res.get("test_command") or "", st["project"].get("test_command", ""))
+        return "implement"
+
+    def _implement(self, run: "PhaseRun") -> str:
+        cfg = self.cfg
+        run.ctx["impl_runs"] += 1
+        res = self.session(run.label, render("implement", run=run.ctx["impl_runs"], **run.common),
+                           cfg["model_impl"], STEP_SCHEMA, "status")
+        if res["status"] == "blocked":
+            raise StepFailed(f"phase {run.n} implementation blocked: {res.get('summary')}")
+        left = unchecked_tasks(run.dir / "PLAN.md")
+        if (res["status"] == "partial" or left) and run.ctx["impl_runs"] < cfg["max_impl_runs"]:
+            log(f"phase {run.n}: {left} task(s) left — continuing in a fresh session")
+            return "implement"
+        if left:
+            run.ctx["warnings"].append(f"{left} PLAN.md task(s) left unchecked")
+        return self.to_tests(run, after=self.next_review(run))
+
+    def _test(self, run: "PhaseRun") -> str:
+        if not (self.state["project"].get("test_command") or "").strip():
+            run.ctx["warnings"].append("no test command configured — the unit suite never ran")
+        ok, summary = self.run_tests(run.dir)
+        self.event(f"p{run.n:02d}-tests", "pass" if ok else "fail", summary)
+        if ok:
+            return run.ctx.get("after_tests") or self.next_review(run)
+        if run.ctx["test_fix_attempts"] >= self.cfg["max_test_fix"]:
+            raise StepFailed(f"phase {run.n}: tests still failing after {run.ctx['test_fix_attempts']} fix "
+                             f"attempts (see {run.dir.as_posix()}/TEST_OUTPUT.txt)")
+        return "test_fix"
+
+    def _test_fix(self, run: "PhaseRun") -> str:
+        cfg = self.cfg
+        run.ctx["test_fix_attempts"] += 1
+        res = self.session(f"{run.label}{run.ctx['test_fix_attempts']}",
+                           render("test_fix", attempt=run.ctx["test_fix_attempts"], max=cfg["max_test_fix"],
+                                  **run.common), cfg["model_impl"], STEP_SCHEMA, "status")
+        if res["status"] == "blocked":
+            raise StepFailed(f"phase {run.n} test fix blocked: {res.get('summary')}")
+        return "test"                           # after_tests still points where the phase was going
+
+    def _review(self, run: "PhaseRun") -> str:
+        cfg = self.cfg
+        run.ctx["review_round"] += 1
+        r = run.ctx["review_round"]
+        git("add", "-A")  # so `git diff <base>` also shows new files
+        prev = (f"- Previous review: `{run.dir.as_posix()}/REVIEW-r{r - 1}.md` — check its blocker/major "
+                "findings were really fixed." if r > 1 else "")
+        res = self.session(f"{run.label}{r}", render("review", round=r, previous_review=prev, **run.common),
+                           cfg["model_review"], REVIEW_SCHEMA, "verdict",
+                           extra_disallowed=("Edit", "Write", "NotebookEdit"))
+        if "verdict" not in res:
+            run.ctx["warnings"].append(f"review round {r} did not complete")
+            return self.after_review(run.ph)
+        findings = res.get("findings") or []
+        md = [f"# Review — phase {run.n} round {r}", "", f"**Verdict:** {res['verdict']}", "",
+              res.get("summary", ""), ""]
+        for f in findings:
+            md += [f"## [{f.get('severity', '?').upper()}] {f.get('title', '')}",
+                   f"`{f.get('file', '')}`" if f.get("file") else "", "", f.get("detail", ""), ""]
+            if f.get("suggested_fix"):
+                md += [f"**Fix:** {f['suggested_fix']}", ""]
+        atomic_write(run.dir / f"REVIEW-r{r}.md", "\n".join(md))
+        if any(f.get("severity") in BLOCKING for f in findings):
+            return "review_fix"
+        return self.after_review(run.ph)
+
+    def _review_fix(self, run: "PhaseRun") -> str:
+        cfg = self.cfg
+        r = run.ctx["review_round"]
+        res = self.session(f"{run.label}{r}", render("review_fix", round=r, **run.common),
+                           cfg["model_impl"], STEP_SCHEMA, "status")
+        if res["status"] == "blocked":
+            run.ctx["warnings"].append(f"review fixes round {r} blocked: {one_line(res.get('summary'), 120)}")
+        if r >= cfg["max_review_rounds"]:
+            run.ctx["warnings"].append(f"review round {r} had blocker/major findings; fixes applied, "
+                                       "not re-reviewed")
+        run.ctx["test_fix_attempts"] = 0
+        return self.to_tests(run, after=self.next_review(run))
+
+    def _with_surfaces(self, run: "PhaseRun", body, skipped: str) -> str:
+        """Run a step against started surfaces, and always stop them unless the phase stays in e2e.
+
+        The teardown is in a `finally` so an interrupt or a failed step does not leave a dev server
+        holding its port for the next run."""
+        if not self.surfaces_up():
+            run.ctx["warnings"].append(skipped)
+            log("WARN e2e surfaces did not start — skipping this step for this phase")
+            self.surfaces_down()
+            return self.after_e2e()
+        nxt = None
+        try:
+            nxt = body(run)
+            return nxt
+        finally:
+            if nxt != "e2e_fix":
+                self.surfaces_down()
+
+    def _e2e(self, run: "PhaseRun") -> str:
+        run.ctx["e2e_runs"] = run.ctx.get("e2e_runs", 0) + 1
+        return self._with_surfaces(run, self._e2e_body, "e2e skipped: the surfaces could not be started")
+
+    def _e2e_body(self, run: "PhaseRun") -> str:
+        cfg, st = self.cfg, self.state
+        res = self.session(run.label, render("e2e", **run.common), cfg["model_qa"], E2E_SCHEMA, "status",
+                           recheck=lambda d: self.command_complaint(
+                               d, ("e2e_command", "e2e_up_command", "e2e_down_command")))
+        for key, cfg_key in (("e2e_command", "e2e_cmd"), ("e2e_up_command", "e2e_up_cmd"),
+                             ("e2e_down_command", "e2e_down_cmd")):
+            if not cfg.get(cfg_key):
+                st["project"][key] = self.vet_command(key, res.get(key) or "", st["project"].get(key, ""))
+        if res["status"] == "blocked":
+            run.ctx["warnings"].append(f"e2e blocked: {one_line(res.get('summary'), 160)}")
+            return self.after_e2e()
+        return self._run_e2e_suite(run)
+
+    def _e2e_fix(self, run: "PhaseRun") -> str:
+        run.ctx["e2e_fix_attempts"] = run.ctx.get("e2e_fix_attempts", 0) + 1
+        nxt = self._with_surfaces(run, self._e2e_fix_body,
+                                  "e2e fix skipped: the surfaces could not be started")
+        if nxt in ("docs", "commit"):
+            # the unit suite has to still be green after fixing the product for end-to-end cases,
+            # and afterwards the phase carries on to where it was going — not back into review
+            ok, summary = self.run_tests(run.dir)
+            self.event(f"p{run.n:02d}-tests", "pass" if ok else "fail", summary + " (after e2e fixes)")
+            if not ok:
+                run.ctx["test_fix_attempts"] = 0
+                run.ctx["after_tests"] = nxt
+                return "test_fix"
+        return nxt
+
+    def _e2e_fix_body(self, run: "PhaseRun") -> str:
+        cfg = self.cfg
+        res = self.session(f"{run.label}{run.ctx['e2e_fix_attempts']}",
+                           render("e2e_fix", attempt=run.ctx["e2e_fix_attempts"], max=cfg["max_e2e_fix"],
+                                  **run.common), cfg["model_impl"], STEP_SCHEMA, "status")
+        if res["status"] == "blocked":
+            run.ctx["warnings"].append(f"e2e fix blocked: {one_line(res.get('summary'), 160)}")
+            return self.after_e2e()
+        return self._run_e2e_suite(run)
+
+    def _run_e2e_suite(self, run: "PhaseRun") -> str:
+        """Run the end-to-end suite and decide whether the phase moves on or goes fixing."""
+        if not self.e2e_command():
+            run.ctx["warnings"].append("no e2e command configured — the end-to-end suite never ran")
+        ok, summary = self.run_e2e(run.dir)
+        self.event(f"p{run.n:02d}-e2e", "pass" if ok else "fail", summary)
+        if ok:
+            return self.after_e2e()
+        if run.ctx.get("e2e_fix_attempts", 0) >= self.cfg["max_e2e_fix"]:
+            run.ctx["warnings"].append(f"e2e still failing after {self.cfg['max_e2e_fix']} fix attempts "
+                                       f"({summary}) — see {run.dir.as_posix()}/E2E_OUTPUT.txt")
+            return self.after_e2e()
+        return "e2e_fix"
+
+    def _docs(self, run: "PhaseRun") -> str:
+        res = self.session(run.label, render("docs", **run.common), self.cfg["model_impl"], STEP_SCHEMA, "status")
+        if res["status"] == "blocked":
+            run.ctx["warnings"].append(f"docs blocked: {one_line(res.get('summary'), 160)}")
+        return "commit"
+
+    def _commit(self, run: "PhaseRun") -> str:
+        st = self.state
+        body = [f"Phase {run.n}/{run.total}: {run.ph['goal']}", "", f"Plan & reviews: {run.dir.as_posix()}/"]
+        if run.ctx.get("warnings"):
+            body += ["", "Warnings:"] + [f"- {w}" for w in run.ctx["warnings"]]
+        sha = self.commit(f"autodev: phase {run.n:02d} — {run.ph['title']}", "\n".join(body))
+        if sha:
+            git("tag", "-f", f"{st['branch']}/phase-{run.n:02d}", check=False)
+        run.ph.update(status="done", commit=sha, warnings=run.ctx.get("warnings", []), finished=ts())
+        self.event(f"p{run.n:02d}-commit", "done", sha or "no changes to commit")
+        self.notify(f"autodev ✅ phase {run.n}/{run.total}: {run.ph['title']}")
+        st["phase_index"], st["phase_ctx"] = run.i + 1, {}
+        return "plan"
 
     def after_review(self, ph: dict) -> str:
         """Where a phase goes once the review is clean: end-to-end QA, documentation, or straight to the commit."""
