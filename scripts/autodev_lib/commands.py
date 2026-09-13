@@ -44,6 +44,32 @@ CMD_FORBIDDEN = (
 )
 CMD_MAX_LEN = 400
 
+# `docker` and friends have to stay in the allowlist — a compose project runs its suite through them —
+# but `docker run -v /:/host` mounts the machine into a container that runs as root, which walks
+# straight past "nothing may write outside the repository". So a container run may only mount paths
+# inside the working directory, and may not ask for privileges.
+CONTAINER_HEADS = {"docker", "podman", "docker-compose", "podman-compose", "nerdctl"}
+VOLUME_SOURCES = re.compile(r"(?:^|\s)(?:-v|--volume)[=\s]+([^\s:]+)")
+MOUNT_SOURCES = re.compile(r"(?:^|\s)--mount[=\s]+(\S+)")
+MOUNT_SOURCE_FIELD = re.compile(r"(?:^|,)(?:source|src)=([^,]+)")
+PRIVILEGE_FLAGS = re.compile(r"(?:^|\s)(--privileged|--cap-add(?:[=\s]|$)|--pid[=\s]*host|"
+                             r"--userns[=\s]*host|--security-opt)")
+
+
+def container_problem(segment: str):
+    """Why this container command is refused, or None. See the note above CONTAINER_HEADS."""
+    flag = PRIVILEGE_FLAGS.search(segment)
+    if flag:
+        return f"`{flag.group(1).strip()}` gives the container the host"
+    sources = VOLUME_SOURCES.findall(segment)
+    for spec in MOUNT_SOURCES.findall(segment):
+        sources += MOUNT_SOURCE_FIELD.findall(spec)
+    for src in sources:
+        src = src.strip("\'\"")
+        if src.startswith(("/", "~")) or src.startswith("..") or "/../" in src:
+            return f"it mounts `{src}` from outside the repository"
+    return None
+
 
 def command_head(segment: str):
     """The binary a shell segment starts with, ignoring env assignments and wrappers."""
@@ -76,6 +102,10 @@ def command_allowed(cmd: str, extra=()) -> tuple:
         head = command_head(segment)
         if head is not None and head not in allowed:
             return False, f"`{head}` is not a known build or test command"
+        if head in CONTAINER_HEADS:
+            why = container_problem(segment)
+            if why:
+                return False, why
     return True, ""
 
 

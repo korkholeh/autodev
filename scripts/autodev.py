@@ -308,7 +308,6 @@ class Orchestrator:
         self.held_back: list = []
         self.run_started = 0.0
         self.sessions_this_run = 0
-        self.tampering: list = []
         self.autonomy = ""
         self.github: GitHub | None = None
         self.push_mode = "never"
@@ -351,6 +350,15 @@ class Orchestrator:
             "is used as typed and never vetted. If a session proposed one and it was refused, the "
             "reason is in the log and in .autodev/DECISIONS.md, and --allow-cmd <binary> accepts "
             "that binary.")
+
+    def warn_run(self, line: str) -> None:
+        """A warning about the run itself, not about one phase.
+
+        Phase warnings ride along in the phase row of PROGRESS.md, which is the right place for
+        anything a phase did. The architect, roadmap and finalize steps have no phase to belong to,
+        so their warnings would otherwise live only in the timeline — or be pinned on whichever
+        phase committed next."""
+        self.state.setdefault("run_warnings", []).append(f"{ts()} — {line}")
 
     def record_decision(self, line: str) -> None:
         """Append a line to DECISIONS.md the same way the sessions do, so a human reads one list."""
@@ -567,10 +575,10 @@ class Orchestrator:
         if not touched:
             return
         self.install_guides()
+        self.warn_run(f"{label} changed .autodev/guides/ ({', '.join(touched)}) — restored from the skill")
         self.event(label, "guides restored", "session wrote .autodev/guides/: " + ", ".join(touched))
         self.record_decision(f"`{label}` changed the working guides ({', '.join(touched)}); they were "
                              "restored from the skill, so later sessions read the originals.")
-        self.tampering.append(f"{label} changed .autodev/guides/ ({', '.join(touched)}) — restored")
 
     @staticmethod
     def worktree_marks() -> set:
@@ -670,11 +678,11 @@ class Orchestrator:
     def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=()):
         cfg, st = self.cfg, self.state
         st["session_counter"] = st.get("session_counter", 0) + 1
-        self.sessions_this_run += 1
         base = AD / "logs" / f"{st['session_counter']:03d}-{label}"
         cmd = self.session_command(prompt, model, schema, resume, extra_disallowed)
 
-        out = {"session_id": resume, "result": None, "interrupted": None, "rejected": False, "exit": None}
+        out = {"session_id": resume, "result": None, "interrupted": None, "rejected": False,
+               "exit": None, "budget": ""}
         started = time.time()
         log(f"▶ {label} [{model}]" + (f" resume {resume[:8]}" if resume else ""))
         with open(f"{base}.jsonl", "a", encoding="utf-8") as jf, open(f"{base}.stderr.log", "a") as ef:
@@ -715,6 +723,10 @@ class Orchestrator:
                     break
                 if self.stop_flag:
                     out["interrupted"] = "stop"
+                elif self.budget_exceeded():
+                    out["budget"] = self.budget_exceeded()
+                    out["interrupted"] = "budget"
+                    log(f"{label}: {out['budget']} — interrupting the session to stop")
                 elif time.time() - started > cfg["session_timeout"] * 60:
                     out["interrupted"] = "timeout"
                     log(f"{label}: session timeout ({cfg['session_timeout']} min) — interrupting")
@@ -766,6 +778,7 @@ class Orchestrator:
         try:
             return self._session(label, prompt, model, schema, required_key, extra_disallowed, recheck)
         finally:
+            self.sessions_this_run += 1     # one step, however many resumes it took
             self.check_guides(label, guides)
 
     def _session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None):
@@ -792,6 +805,11 @@ class Orchestrator:
             if out["interrupted"] == "stop":
                 self.save()
                 raise StopRequested("signal")
+            if out["interrupted"] == "budget":
+                # the resume handle is already on disk (note_session), so the same `run` picks the
+                # step up where the session was interrupted
+                self.save()
+                raise StopRequested(out["budget"])
             if out["interrupted"] == "limit" or out["rejected"]:
                 if out["rejected"]:
                     rejections += 1
@@ -1396,9 +1414,8 @@ class Orchestrator:
         if run.ctx.get("warnings"):
             body += ["", "Warnings:"] + [f"- {w}" for w in run.ctx["warnings"]]
         sha = self.commit(f"autodev: phase {run.n:02d} — {run.ph['title']}", "\n".join(body))
-        if self.held_back or self.tampering:
-            run.ctx["warnings"] = run.ctx.get("warnings", []) + self.held_back + self.tampering
-            self.tampering = []
+        if self.held_back:
+            run.ctx["warnings"] = run.ctx.get("warnings", []) + self.held_back
         if sha:
             git("tag", "-f", f"{st['branch']}/phase-{run.n:02d}", check=False)
         run.ph.update(status="done", commit=sha, warnings=run.ctx.get("warnings", []), finished=ts())
@@ -1511,6 +1528,8 @@ class Orchestrator:
         if st.get("status") == "stopped" and st.get("stop_reason"):
             lines += [f"> ⏹ **Stopped:** {one_line(st['stop_reason'], 300)} — the same `run` command continues "
                       "from here.", ""]
+        if st.get("run_warnings"):
+            lines += ["## Run warnings", ""] + [f"- {one_line(w, 300)}" for w in st["run_warnings"][-20:]] + [""]
         if phases:
             icons = {"pending": "⏳", "in_progress": "🔨", "done": "✅", "failed": "❌"}
             lines += ["## Phases", "", "| # | Phase | User-facing | Status | Commit | Warnings |",
@@ -1600,6 +1619,18 @@ def cli_overrides(args) -> dict:
     return over
 
 
+def same_file(a, b) -> bool:
+    """Whether two paths name the same spec — `docs/spec.md` and its absolute form are one file."""
+    if not a or not b:
+        return False
+    if str(a) == str(b):
+        return True
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
 def cmd_run(args) -> int:
     if args.fresh and AD.exists():
         bak = Path(f".autodev.bak-{datetime.now():%Y%m%d-%H%M%S}")
@@ -1617,7 +1648,7 @@ def cmd_run(args) -> int:
         except StepFailed as e:
             sys.exit(str(e))
         state["config"] = {**DEFAULTS, **state["config"], **cli_overrides(args)}
-        if args.spec and Path(args.spec).as_posix() != state.get("spec"):
+        if args.spec and not same_file(args.spec, state.get("spec")):
             print(f"WARNING --spec {args.spec} ignored: this run follows {state.get('spec')} "
                   "(--fresh starts over with a different spec)")
         print(f"resuming run: status={state['status']} step={state['step']}")
@@ -1806,7 +1837,8 @@ def main() -> int:
     run.add_argument("--max-hours", dest="max_hours", type=float, metavar="H",
                      help="stop the run after H hours of wall clock (resume with the same command)")
     run.add_argument("--max-sessions", dest="max_sessions", type=int, metavar="N",
-                     help="stop the run after N sessions started in this run")
+                     help="stop the run after N steps in this run (a step is one session, however "
+                          "many times it had to resume)")
     run.add_argument("--session-timeout", dest="session_timeout", type=int, help="minutes per session")
     run.add_argument("--test-timeout", dest="test_timeout", type=int, help="minutes")
     run.add_argument("--poll-interval", dest="poll_interval", type=int, help="seconds")

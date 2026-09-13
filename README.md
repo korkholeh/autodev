@@ -156,8 +156,11 @@ the next attempt happens after the next phase.
 waits, so a long roadmap can keep starting sessions for days. `--max-hours H` and `--max-sessions N` stop the run
 instead — the branch, `PROGRESS.md` and the commits are all there, the reason is written into both, and the same
 `run` command continues from where it stopped (with a fresh budget, which is the point: spending more is your
-decision). A usage pause that would end after the deadline does not happen at all — the run stops rather than
-sleeping into a morning nobody asked for.
+decision). The hour ceiling reaches into a running session: it is interrupted the same way a usage limit
+interrupts it, and the resume handle is on disk, so continuing picks the step up rather than restarting it.
+`--max-sessions` counts steps — one step is one session, however many times it had to resume. A usage pause that
+would end after the deadline does not happen at all: the run stops rather than sleeping into a morning nobody
+asked for.
 
 Before every session, and every 5 minutes during one, the script reads the 5h/7d utilization. At ≥85% it sends
 SIGINT to the current session, sleeps until the reset (+2 min), then `--resume`s the same session. Sources: the
@@ -176,7 +179,10 @@ the spec, the repository and (unless you disable them) web pages, any of which c
 something else. A proposed command is accepted only when every segment starts with a known toolchain binary
 (`make`, `uv`, `pytest`, `npm`, `cargo`, `swift`, `xcodebuild`, `go`, `cmake`, `gradle`, `docker`, …) and nothing
 in it fetches or evaluates code, escalates privileges, or redirects outside the repository. Commands **you** pass
-(`--test-cmd`, `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`) are used as typed and never checked.
+(`--test-cmd`, `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`) are used as typed and never checked. `docker` and
+`podman` stay on that list — a compose project runs its suite through them — but a container the session proposes
+may only mount paths inside the repository and may not ask for privileges (`-v /:/host`, `--privileged`,
+`--cap-add` and friends are refused), because that is the one way an allowed binary walks around the rest.
 
 **What the vetting does not cover.** It checks the shape of a command, not what the command runs: `make test`
 runs whatever the `Makefile` says, and the `Makefile` — like `package.json`, the test suite and the application
@@ -200,7 +206,9 @@ both end without a usable test command, the run fails there — minutes after la
 **What a session can reach.** Sessions run with `--permission-mode auto` (a classifier checks each action) and
 `--permission-prompts none`. On top of that, a session gets no `AUTODEV_*` variable from the environment (the
 usage token above all), no MCP server beyond the ones you name with `--mcp-config`, and no web access: `WebFetch`
-and `WebSearch` are blocked unless you pass `--web on`. Web access is the one channel that reaches outside the
+and `WebSearch` are blocked unless you pass `--web on`. The rest of the environment is inherited as it is — a
+session, and every test command, sees whatever the terminal you launched from had: `AWS_*`, `GH_TOKEN`,
+`KUBECONFIG`, cloud credentials. Launch an unattended run from a shell that carries only what the project needs. Web access is the one channel that reaches outside the
 repository, which is why an unattended run does without it by default — turn it on when the work needs to look
 something up. `--inherit-mcp` hands the sessions your own MCP servers instead. Hooks from `~/.claude` still run
 in the sessions: check that they do not block large changes (e.g. PR size limits). `--permission-mode bypass` —
