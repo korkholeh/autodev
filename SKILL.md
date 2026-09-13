@@ -17,8 +17,8 @@ Never implement the spec yourself in this session.
 
 Run `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py doctor --spec <spec-file>` and resolve issues with the user:
 
-- **FAIL** lines must be fixed before launch (missing spec, git identity, Claude Code not found, a missing toolchain
-  for the detected stack profile).
+- **FAIL** lines must be fixed before launch (missing spec, git identity, Claude Code not found, a trial headless
+  session that returned nothing usable, a missing toolchain for the detected stack profile).
 - **Existing run** in `.autodev/`: ask whether to resume (default) or start over (`--fresh`). If the doctor says
   the state was not started on this machine, it arrived with the repository — read `.autodev/state.json` with the
   user before offering `--adopt`, since it names the commands the orchestrator will run.

@@ -70,13 +70,23 @@ class GitHub:
             self.can_push = self.gh("api", f"repos/{self.repo}", "--jq", ".permissions.push", check=False) == "true"
         return self.repo
 
+    def remote_url(self) -> str:
+        return f"https://{self.host}/{self.repo}.git"
+
+    def push_command(self, branch: str) -> list:
+        """The push argv. The token lives in this process's environment, so nothing else may run here.
+
+        A pre-push hook would run with that environment, and a hook is a file in the repository that
+        a session can write. It is turned off for this one command, in two ways, rather than trusted:
+        autodev has already run the suite before committing, so there is nothing for it to add."""
+        return ["git", "-c", "credential.helper=", "-c", f"credential.https://{self.host}.helper=",
+                "-c", f"credential.helper={PUSH_HELPER}", "-c", "core.hooksPath=/dev/null",
+                "push", "--no-verify", self.remote_url(), f"HEAD:refs/heads/{branch}"]
+
     def push(self, branch: str) -> None:
         env = {**os.environ, "AUTODEV_GH_LOGIN": self.login, "AUTODEV_GH_TOKEN": self.token,
                "GIT_TERMINAL_PROMPT": "0"}
-        cmd = ["git", "-c", "credential.helper=", "-c", f"credential.https://{self.host}.helper=",
-               "-c", f"credential.helper={PUSH_HELPER}",
-               "push", f"https://{self.host}/{self.repo}.git", f"HEAD:refs/heads/{branch}"]
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
+        r = subprocess.run(self.push_command(branch), capture_output=True, text=True, env=env, timeout=900)
         if r.returncode != 0:
             raise RuntimeError(one_line(r.stderr or r.stdout, 400))
         if self.repo_from_remote:  # keep `git status` / upstream tracking sane locally

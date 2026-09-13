@@ -26,8 +26,10 @@ In Claude Code, at the project root:
 /autodev docs/spec.md --e2e-up-cmd 'make dev-up' --e2e-ready-url http://localhost:8000/health
 ```
 
-The skill runs a pre-flight check (`doctor`), conducts an interview (up to 6 questions — stack, data, access,
-scope limit for the night), writes the answers to `.autodev/INTAKE.md`, and starts the orchestrator in tmux.
+The skill runs a pre-flight check (`doctor`) — which includes one trial headless session, so an expired login, a
+hook that blocks headless mode or a build without structured output is found now and not at 3am — conducts an
+interview (up to 6 questions — stack, data, access, scope limit for the night), writes the answers to
+`.autodev/INTAKE.md`, and starts the orchestrator in tmux. `doctor --no-smoke` skips the trial session.
 Or directly from the terminal:
 
 ```bash
@@ -99,6 +101,7 @@ from then on every session reads that file.
 | `--mcp-config FILE` | MCP servers for the sessions, a file or a JSON string (repeatable) |
 | `--inherit-mcp` | also give the sessions the MCP servers configured for you |
 | `--allow-no-verify` | commit past a failing git hook instead of stopping |
+| `--max-file-mb MB` | hold a staged file larger than this out of the commit (5 by default, 0 = no limit) |
 | `--adopt` | resume run state in `.autodev/` that this machine did not create |
 | `--no-docs`, `--no-finalize` | disable the documentation step / the final session |
 | `--model-plan\|impl\|review\|qa` | models per step (opus / sonnet / opus / sonnet) |
@@ -122,7 +125,10 @@ autodev.py run    --spec docs/spec.md --gh-user oleh-work --pr
 The author and committer are set via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for every commit of the run; the push goes
 to `https://<host>/<repo>.git` with a one-shot credential helper that reads the token from the push process's
 environment (not from argv, not from disk, not from the global config), so it works with SSH remotes too. The
-token is never passed into Claude sessions and never written to `.autodev/`. If there is no token for the account,
+token is never passed into Claude sessions and never written to `.autodev/`. The push runs with hooks off
+(`--no-verify` and an empty `core.hooksPath`): a `pre-push` hook is a file in the repository that a session can
+write, and it would run with the token in its environment. The suite has already passed before the commit, so
+there is nothing such a hook could usefully add. If there is no token for the account,
 or it belongs to a different login, the run fails immediately, before the first commit. If there is no push
 permission, commits stay local and push/PR are disabled with a warning. A push failure does not stop the run —
 the next attempt happens after the next phase.
@@ -176,6 +182,15 @@ or the lint gate — so a hook that rejects a commit stops the run instead of be
 handled automatically is a hook that reformats files and then fails: what it wrote is restaged and committed once.
 `--allow-no-verify` restores the old behaviour for a repository whose hooks are known to be broken, and every
 bypass is recorded in `DECISIONS.md`.
+
+**Not everything a session leaves behind gets committed.** `git add -A` cannot tell a phase's work from whatever
+else is in the tree, so the index is filtered before every commit. Held back: files that normally hold credentials
+(`.env`, `*.pem`, `id_rsa`, `.netrc`, a service-account JSON), installed or generated directories (`node_modules/`,
+`.venv/`, `target/debug/`, `e2e/artifacts/`, `DerivedData/`), anything larger than `--max-file-mb` (5 MB by
+default), and any file whose contents match a credential — an AWS key id, a GitHub or Slack token, a private key
+block, a signed token. A held-back file stays in the working tree and is named in the log, in `DECISIONS.md` and
+in the phase's warnings. Gitignore it if it does not belong in the repository, or commit it yourself if it does —
+after that it is an ordinary tracked file and nothing stops it again.
 
 **A run belongs to the machine that started it.** `.autodev/state.json` names the commands the orchestrator runs
 and the branch it pushes, and a repository can carry a `.autodev/` of its own. Each run is claimed by a marker

@@ -41,6 +41,7 @@ if str(_HERE) not in sys.path:              # so autodev_lib imports whether run
 
 from autodev_lib.commands import CMD_CORRECTION, CMD_FIELDS, command_allowed  # noqa: E402
 from autodev_lib.github import GitHub  # noqa: E402
+from autodev_lib.staging import why_not_committable  # noqa: E402
 from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
 from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
                               STOP_FILE, SURFACE_LOG, StepFailed, StopRequested, atomic_write,
@@ -87,6 +88,7 @@ DEFAULTS = {
     "mcp_config": [],       # MCP server definitions to give the sessions (files or JSON strings)
     "inherit_mcp": False,   # True = let the sessions see the user's own MCP servers too
     "allow_no_verify": False,   # True = commit past a failing git hook instead of stopping
+    "max_file_mb": 5,       # a staged file larger than this is held back (0 = no limit)
     # git / GitHub
     "gh_user": "",        # gh account login to commit & push as
     "gh_host": "github.com",
@@ -274,6 +276,7 @@ class Orchestrator:
         self.stop_flag = False
         self.supports_prompts_none = False
         self.claude_flags: set = set()
+        self.held_back: list = []
         self.autonomy = ""
         self.github: GitHub | None = None
         self.push_mode = "never"
@@ -855,6 +858,26 @@ class Orchestrator:
         log(f"running e2e: {cmd}")
         return self._shell(cmd, self.cfg["e2e_timeout"], pdir / "E2E_OUTPUT.txt", "e2e suite")
 
+    def guard_staged(self) -> list:
+        """Take back out of the index anything that must not be committed automatically.
+
+        `git add -A` cannot tell a phase's work from whatever else a session left in the tree, and
+        with --pr the difference reaches GitHub the same night. A held-back file stays on disk and is
+        reported; committing it yourself is what tells autodev it belongs here."""
+        limit = int(self.cfg.get("max_file_mb") or 0) * 1048576
+        staged = git("diff", "--cached", "--name-only", "--diff-filter=ACMR", check=False).splitlines()
+        blocked = [(p, why_not_committable(Path(p), limit)) for p in staged if p]
+        blocked = [(p, why) for p, why in blocked if why]
+        for path, why in blocked:
+            git("reset", "-q", "HEAD", "--", path, check=False)
+            log(f"WARN not committing {path}: {why}")
+            self.record_decision(f"kept `{path}` out of the commit — {why}. It is still in the working "
+                                 "tree: gitignore it if it does not belong here, or commit it yourself "
+                                 "if it does.")
+        if blocked:
+            self.event("commit", "held back", "; ".join(f"{p} ({w})" for p, w in blocked[:6]))
+        return [f"not committed: {p} ({w})" for p, w in blocked]
+
     def commit(self, message: str, body: str) -> str | None:
         """Commit the work. A failing commit hook stops the run rather than being bypassed.
 
@@ -867,6 +890,7 @@ class Orchestrator:
                                   capture_output=True, text=True)
 
         git("add", "-A")
+        self.held_back = self.guard_staged()
         if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
             return None
         before = git("status", "--porcelain", check=False)
@@ -1207,6 +1231,8 @@ class Orchestrator:
         if run.ctx.get("warnings"):
             body += ["", "Warnings:"] + [f"- {w}" for w in run.ctx["warnings"]]
         sha = self.commit(f"autodev: phase {run.n:02d} — {run.ph['title']}", "\n".join(body))
+        if self.held_back:
+            run.ctx["warnings"] = run.ctx.get("warnings", []) + self.held_back
         if sha:
             git("tag", "-f", f"{st['branch']}/phase-{run.n:02d}", check=False)
         run.ph.update(status="done", commit=sha, warnings=run.ctx.get("warnings", []), finished=ts())
@@ -1339,6 +1365,53 @@ class Orchestrator:
 
 
 # ----------------------------------------------------------------------------- CLI
+SMOKE_SCHEMA = {"type": "object", "properties": {"status": {"type": "string"}}, "required": ["status"]}
+
+
+def smoke_command(binary: str, flags: set, model: str = "haiku") -> list:
+    """A session small enough to be free and complete enough to prove the real ones will work."""
+    cmd = [binary, "-p", 'Reply with {"status":"ok"} and nothing else.',
+           "--output-format", "stream-json", "--verbose", "--model", model,
+           "--json-schema", json.dumps(SMOKE_SCHEMA), "--permission-mode", "auto",
+           "--disallowedTools", "AskUserQuestion,WebFetch,WebSearch"]
+    if "--permission-prompts" in flags:
+        cmd += ["--permission-prompts", "none"]
+    if "--strict-mcp-config" in flags:
+        cmd += ["--strict-mcp-config"]
+    return cmd
+
+
+def read_smoke_result(stdout: str, stderr: str, code: int) -> tuple:
+    """(ok, what to tell the developer) for the output of a smoke session."""
+    for line in reversed((stdout or "").splitlines()):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") != "result":
+            continue
+        if extract_json(ev, "status"):
+            return True, "a headless session runs and returns structured output"
+        return False, ("a session ran but returned no structured output — check --json-schema support: "
+                       + one_line(ev.get("result"), 160))
+    return False, f"no result from the session (exit {code}): {one_line(stderr, 200)}"
+
+
+def smoke_session(binary: str, timeout: int = 180) -> tuple:
+    """Everything checked before this is static — a version number, a token on a disk.
+
+    This is what finds an expired login, a hook that blocks headless mode, or a build whose
+    structured output does not work, and it finds them now instead of at 3am."""
+    try:
+        r = subprocess.run(smoke_command(binary, claude_flags(binary)), capture_output=True,
+                           text=True, timeout=timeout, env=child_env())
+    except subprocess.TimeoutExpired:
+        return False, f"a session did not answer within {timeout}s"
+    except OSError as e:
+        return False, f"could not start a session: {e}"
+    return read_smoke_result(r.stdout, r.stderr, r.returncode)
+
+
 def new_state(spec: str, cfg: dict) -> dict:
     return {"version": 1, "spec": spec, "created": ts(), "status": "running", "branch": None, "config": cfg,
             "run_id": secrets.token_hex(16),
@@ -1427,6 +1500,11 @@ def cmd_doctor(args) -> int:
         v = ".".join(map(str, ver))
         rep("OK" if ver >= PERMISSION_PROMPTS_MIN else "WARN",
             f"Claude Code {v}" + ("" if ver >= PERMISSION_PROMPTS_MIN else " — update recommended (≥2.1.259)"))
+        if args.no_smoke:
+            rep("INFO", "headless session: not tried (--no-smoke)")
+        else:
+            ok, detail = smoke_session(binary)
+            rep("OK" if ok else "FAIL", f"headless session: {detail}")
     if args.gh_user:
         try:
             gh = GitHub(args.gh_user, args.gh_host or "github.com", args.gh_repo or "", args.remote or "origin").connect()
@@ -1542,6 +1620,8 @@ def main() -> int:
                      help="also give the sessions the MCP servers configured for you")
     run.add_argument("--allow-no-verify", dest="allow_no_verify", action="store_const", const=True,
                      help="commit past a failing git hook instead of stopping")
+    run.add_argument("--max-file-mb", dest="max_file_mb", type=int, metavar="MB",
+                     help="hold back a staged file larger than this (default 5, 0 = no limit)")
     run.add_argument("--allow-cmd", dest="allow_cmd", action="append", metavar="BINARY",
                      help="also accept commands starting with BINARY when a session proposes one "
                           "(repeatable); commands you pass yourself are never checked")
@@ -1557,6 +1637,8 @@ def main() -> int:
 
     doc = sub.add_parser("doctor", help="pre-flight checks")
     doc.add_argument("--spec")
+    doc.add_argument("--no-smoke", action="store_true",
+                     help="skip the trial headless session (it costs one small request)")
     doc.add_argument("--claude-bin", dest="claude_bin")
     doc.add_argument("--profile")
     doc.add_argument("--gh-user", dest="gh_user")

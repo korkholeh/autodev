@@ -12,6 +12,7 @@ and how the usage guard reads a limit.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import socket
 import subprocess
@@ -27,7 +28,7 @@ autodev = importlib.util.module_from_spec(_spec)
 sys.modules["autodev"] = autodev
 _spec.loader.exec_module(autodev)                 # this also puts scripts/ on sys.path
 
-from autodev_lib import commands, usage, util     # noqa: E402  (the entry point above enables this)
+from autodev_lib import commands, staging, usage, util   # noqa: E402  (enabled by the entry point)
 
 
 class TempCwd(unittest.TestCase):
@@ -36,9 +37,11 @@ class TempCwd(unittest.TestCase):
     def setUp(self):
         self._old = os.getcwd()
         self._tmp = tempfile.TemporaryDirectory()
+        self._git = autodev.git          # a harness that stubs it must not leak into the next test
         os.chdir(self._tmp.name)
 
     def tearDown(self):
+        autodev.git = self._git
         os.chdir(self._old)
         self._tmp.cleanup()
 
@@ -264,8 +267,7 @@ class PhaseRouting(TempCwd):
         for step, method in autodev.PHASE_STEPS.items():
             self.assertTrue(callable(getattr(autodev.Orchestrator, method, None)),
                             f"{step} -> {method} is not a method")
-        o = PhaseHarness().o
-        self.addCleanup(lambda: None)
+        o = self.drive().o
         for produced in (o.after_review({"user_facing": True}), o.after_review({"user_facing": False}),
                          o.after_e2e()):
             self.assertIn(produced, autodev.PHASE_STEPS)
@@ -745,6 +747,195 @@ class CommitHooks(TempCwd):
         sha = o.commit("autodev: phase 01", "body")
         self.assertTrue(sha)
         self.assertIsNone(o.commit("autodev: nothing changed", "body"))
+
+
+FAKE_AWS_KEY = "AKIA" + "QWERTYUIOPASDFGH"
+FAKE_GH_TOKEN = "ghp_" + "a" * 36
+
+
+class WhatMayBeCommitted(TempCwd):
+    """`git add -A` takes everything a session left behind; this decides what that may include."""
+
+    def why(self, name, body="hello\n", limit=0):
+        path = Path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body.encode() if isinstance(body, str) else body)
+        return staging.why_not_committable(path, limit)
+
+    def test_ordinary_source_is_fine(self):
+        self.assertIsNone(self.why("src/app.py", "def main():\n    return 1\n"))
+        self.assertIsNone(self.why("docs/user/getting-started.md"))
+        self.assertIsNone(self.why("e2e/plans/login.plan.yaml"))
+
+    def test_credentials_by_name_are_held_back(self):
+        for name in (".env", ".env.local", "config/.env.production", "deploy/id_rsa",
+                     "certs/server.pem", "keys/app.p12", "gcp-service-account.json", ".netrc"):
+            self.assertIsNotNone(self.why(name), name)
+
+    def test_example_environment_files_are_not_credentials(self):
+        for name in (".env.example", ".env.sample", ".env.template"):
+            self.assertIsNone(self.why(name), name)
+
+    def test_installed_and_generated_directories_are_held_back(self):
+        for name in ("node_modules/left-pad/index.js", ".venv/lib/site.py", "target/debug/app.d",
+                     "e2e/artifacts/trace.zip", "playwright-report/index.html", "__pycache__/x.pyc",
+                     "DerivedData/Build/x.o"):
+            self.assertIsNotNone(self.why(name), name)
+
+    def test_a_secret_inside_an_ordinary_file_is_held_back(self):
+        self.assertIn("AWS", self.why("src/settings.py", f'KEY = "{FAKE_AWS_KEY}"\n'))
+        self.assertIn("GitHub", self.why("src/ci.py", f'TOKEN = "{FAKE_GH_TOKEN}"\n'))
+        self.assertIn("private key", self.why("src/k.txt", "-----BEGIN RSA PRIVATE KEY-----\nx\n"))
+
+    def test_a_file_over_the_limit_is_held_back(self):
+        self.assertIn("MB", self.why("fixtures/big.bin", "x" * 200_000, limit=100_000))
+        self.assertIsNone(self.why("fixtures/small.bin", "x" * 200_000, limit=1_000_000))
+        self.assertIsNone(self.why("fixtures/nolimit.bin", "x" * 200_000, limit=0))
+
+    def test_binary_content_is_not_scanned_for_secrets(self):
+        self.assertIsNone(self.why("assets/logo.png", b"\x89PNG\r\n\x00\x00" + FAKE_AWS_KEY.encode()))
+
+    def test_a_file_that_vanished_is_not_a_problem(self):
+        self.assertIsNone(staging.why_not_committable(Path("gone.txt"), 10))
+
+
+class StagingGuard(TempCwd):
+    """The same rules, applied to a real index by a real commit."""
+
+    def repo(self, **cfg):
+        for args in (["init", "-q", "."], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "T"]):
+            subprocess.run(["git", *args], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], check=True,
+                       capture_output=True)
+        Path(".autodev").mkdir(exist_ok=True)
+        conf = dict(autodev.DEFAULTS)
+        conf.update(cfg)
+        return autodev.Orchestrator(autodev.new_state("spec.md", conf))
+
+    def committed(self):
+        return set(subprocess.run(["git", "show", "--name-only", "--format=", "HEAD"],
+                                  capture_output=True, text=True).stdout.split())
+
+    def test_the_work_is_committed_and_the_rest_is_not(self):
+        o = self.repo()
+        Path("src").mkdir()
+        Path("src/app.py").write_text("x = 1\n")
+        Path(".env").write_text("DB_PASSWORD=hunter2\n")
+        Path("node_modules/pkg").mkdir(parents=True)
+        Path("node_modules/pkg/index.js").write_text("module.exports = 1\n")
+        self.assertTrue(o.commit("autodev: phase 01", "body"))
+        self.assertIn("src/app.py", self.committed())
+        self.assertNotIn(".env", self.committed())
+        self.assertFalse([f for f in self.committed() if f.startswith("node_modules")])
+
+    def test_a_held_back_file_stays_on_disk_and_is_reported(self):
+        o = self.repo()
+        Path("keep.py").write_text("x = 1\n")
+        Path(".env").write_text("SECRET=1\n")
+        o.commit("autodev: phase 01", "body")
+        self.assertTrue(Path(".env").is_file())
+        self.assertTrue(any(".env" in w for w in o.held_back))
+        self.assertIn(".env", Path(".autodev/DECISIONS.md").read_text())
+        self.assertTrue(any(e["status"] == "held back" for e in o.state["events"]))
+
+    def test_a_secret_a_session_pasted_into_source_does_not_get_committed(self):
+        o = self.repo()
+        Path("settings.py").write_text(f'AWS_KEY = "{FAKE_AWS_KEY}"\n')
+        Path("ok.py").write_text("x = 1\n")
+        o.commit("autodev: phase 01", "body")
+        self.assertEqual(self.committed(), {"ok.py"})
+
+    def test_a_commit_of_nothing_but_held_back_files_makes_no_commit(self):
+        o = self.repo()
+        Path(".env").write_text("SECRET=1\n")
+        self.assertIsNone(o.commit("autodev: phase 01", "body"))
+
+    def test_committing_it_yourself_settles_the_question(self):
+        o = self.repo()
+        Path(".env").write_text("SECRET=1\n")
+        subprocess.run(["git", "add", "-f", ".env"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "deliberate"], check=True, capture_output=True)
+        Path("app.py").write_text("x = 1\n")
+        o.commit("autodev: phase 01", "body")
+        self.assertEqual(o.held_back, [])
+
+    def test_the_size_limit_is_configurable(self):
+        o = self.repo(max_file_mb=0)
+        Path("big.bin").write_bytes(b"\x00" * (6 * 1048576))
+        o.commit("autodev: phase 01", "body")
+        self.assertIn("big.bin", self.committed())
+
+
+class PushIsolation(TempCwd):
+    """The push carries the token in its environment, so nothing else may run alongside it."""
+
+    def github(self, url):
+        gh = autodev.GitHub("me")
+        gh.token, gh.login, gh.repo = "token", "me", "owner/repo"
+        gh.remote_url = lambda: url
+        return gh
+
+    def test_the_push_turns_hooks_off_and_keeps_the_helper(self):
+        argv = self.github("https://github.com/owner/repo.git").push_command("autodev/x")
+        self.assertIn("--no-verify", argv)
+        self.assertIn("core.hooksPath=/dev/null", argv)
+        self.assertIn("HEAD:refs/heads/autodev/x", argv)
+        self.assertTrue(any("AUTODEV_GH_TOKEN" in a for a in argv))       # only via the helper
+
+    def test_a_pre_push_hook_does_not_run(self):
+        subprocess.run(["git", "init", "-q", "--bare", "remote.git"], check=True, capture_output=True)
+        Path("work").mkdir()
+        os.chdir("work")
+        for args in (["init", "-q", "."], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "T"]):
+            subprocess.run(["git", *args], check=True, capture_output=True)
+        Path("a.txt").write_text("one\n")
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "one"], check=True, capture_output=True)
+        hook = Path(".git/hooks/pre-push")
+        hook.write_text("#!/bin/sh\ntouch ../hook-ran\nexit 1\n")
+        hook.chmod(0o755)
+        self.github("../remote.git").push("autodev/x")
+        self.assertFalse(Path("../hook-ran").exists(), "a pre-push hook ran with the token in scope")
+        branches = subprocess.run(["git", "--git-dir", "../remote.git", "branch"],
+                                  capture_output=True, text=True).stdout
+        self.assertIn("autodev/x", branches)
+
+
+class HeadlessSmokeTest(unittest.TestCase):
+    """The doctor's trial session: what it asks for, and how it reads the answer."""
+
+    def test_it_asks_for_structured_output_behind_the_same_fence(self):
+        argv = autodev.smoke_command("claude", {"--permission-prompts", "--strict-mcp-config"})
+        self.assertIn("--json-schema", argv)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("none", argv)
+        blocked = argv[argv.index("--disallowedTools") + 1]
+        self.assertIn("WebFetch", blocked)
+        self.assertIn("AskUserQuestion", blocked)
+
+    def test_it_leaves_out_options_this_build_lacks(self):
+        argv = autodev.smoke_command("claude", set())
+        self.assertNotIn("--strict-mcp-config", argv)
+        self.assertNotIn("--permission-prompts", argv)
+
+    def test_structured_output_means_the_sessions_will_work(self):
+        line = json.dumps({"type": "result", "structured_output": {"status": "ok"}})
+        ok, detail = autodev.read_smoke_result(line, "", 0)
+        self.assertTrue(ok, detail)
+
+    def test_a_session_without_structured_output_fails_the_check(self):
+        line = json.dumps({"type": "result", "result": "sure, here you go"})
+        ok, detail = autodev.read_smoke_result(line, "", 0)
+        self.assertFalse(ok)
+        self.assertIn("--json-schema", detail)
+
+    def test_no_result_at_all_reports_the_exit_code_and_stderr(self):
+        ok, detail = autodev.read_smoke_result("", "Invalid API key", 1)
+        self.assertFalse(ok)
+        self.assertIn("Invalid API key", detail)
+        self.assertIn("exit 1", detail)
 
 
 class SkillLayout(unittest.TestCase):
