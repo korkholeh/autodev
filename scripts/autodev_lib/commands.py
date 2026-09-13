@@ -66,6 +66,8 @@ def container_problem(segment: str):
         sources += MOUNT_SOURCE_FIELD.findall(spec)
     for src in sources:
         src = src.strip("\'\"")
+        if "$" in src:          # $HOME, ${PWD}/.. — the orchestrator cannot tell where that points
+            return f"it mounts `{src}`, a path that is only known once the shell expands it"
         if src.startswith(("/", "~")) or src.startswith("..") or "/../" in src:
             return f"it mounts `{src}` from outside the repository"
     return None

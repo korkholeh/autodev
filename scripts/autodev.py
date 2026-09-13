@@ -724,7 +724,7 @@ class Orchestrator:
                 if self.stop_flag:
                     out["interrupted"] = "stop"
                 elif self.budget_exceeded():
-                    out["budget"] = self.budget_exceeded()
+                    out["budget"] = self.budget_exceeded() or "the run budget is spent"
                     out["interrupted"] = "budget"
                     log(f"{label}: {out['budget']} — interrupting the session to stop")
                 elif time.time() - started > cfg["session_timeout"] * 60:

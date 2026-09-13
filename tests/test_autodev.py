@@ -712,6 +712,11 @@ class CommandVetting(unittest.TestCase):
             self.assertFalse(ok, cmd)
             self.assertIn("outside the repository", why)
 
+    def test_a_container_may_not_mount_a_path_only_the_shell_knows(self):
+        ok, why = commands.command_allowed("docker run -v $HOME:/w img make test")
+        self.assertFalse(ok)
+        self.assertIn("expands", why)
+
     def test_a_container_may_not_ask_for_privileges(self):
         ok, why = commands.command_allowed("docker run --privileged img make test")
         self.assertFalse(ok)
