@@ -219,6 +219,20 @@ def current_branch_or_fail() -> str:
     return cur
 
 
+def kill_group(proc: subprocess.Popen, sig=signal.SIGKILL) -> None:
+    """Signal a child's whole process group, falling back to the child alone.
+
+    Sessions and shell commands are started with `start_new_session=True`, so the child leads its own
+    group and everything it spawned is in it."""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def claim_run(run_id: str) -> None:
     """Record on this machine that the run in this directory is ours."""
     atomic_write(run_marker(), json.dumps(
@@ -534,7 +548,7 @@ class Orchestrator:
     def _on_signal(self, signum, _frame):
         if self.stop_flag:
             if self.child and self.child.poll() is None:
-                self.child.kill()
+                kill_group(self.child)
             raise SystemExit(130)
         self.stop_flag = True
         log(f"signal {signum}: stopping (interrupting the current session; send again to force)")
@@ -548,6 +562,10 @@ class Orchestrator:
 
     # ---- claude sessions -------------------------------------------------------
     def _interrupt(self, proc: subprocess.Popen) -> None:
+        """Stop a session, gently first.
+
+        The last step kills the whole process group: a session starts processes of its own — a test
+        run, a dev server, a browser — and killing only `claude` leaves them holding their ports."""
         for sig, wait in ((signal.SIGINT, 90), (signal.SIGTERM, 30)):
             try:
                 proc.send_signal(sig)
@@ -558,7 +576,7 @@ class Orchestrator:
                 return
             except subprocess.TimeoutExpired:
                 continue
-        proc.kill()
+        kill_group(proc)
         proc.wait()
 
     def session_command(self, prompt, model, schema, resume=None, extra_disallowed=()) -> list:
@@ -585,6 +603,14 @@ class Orchestrator:
             cmd += ["--resume", resume]
         return cmd
 
+    def note_session(self, label: str, session_id: str) -> None:
+        """Write the resume handle to state.json while the session is still running.
+
+        It used to live in memory until the next save, so a SIGKILL or a power cut in the middle of a
+        long session lost the handle and the step started again from nothing."""
+        self.state["active_session"] = {"label": label, "session_id": session_id}
+        self.save()
+
     def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=()):
         cfg, st = self.cfg, self.state
         st["session_counter"] = st.get("session_counter", 0) + 1
@@ -609,8 +635,7 @@ class Orchestrator:
                         continue
                     sid = ev.get("session_id")
                     if sid and out["session_id"] != sid:
-                        out["session_id"] = sid
-                        st["active_session"] = {"label": label, "session_id": sid}
+                        out["session_id"] = sid      # the main loop writes it to disk (note_session)
                     t = ev.get("type")
                     if t == "rate_limit_event":
                         info = ev.get("rate_limit_info") or {}
@@ -623,8 +648,12 @@ class Orchestrator:
             th = threading.Thread(target=reader, daemon=True)
             th.start()
             last_poll = time.time()
+            noted = resume
             while proc.poll() is None:
                 time.sleep(2)
+                if out["session_id"] and out["session_id"] != noted:
+                    noted = out["session_id"]        # saving is the main loop's job, not the reader's
+                    self.note_session(label, noted)
                 if proc.poll() is not None:
                     break
                 if self.stop_flag:
@@ -789,7 +818,7 @@ class Orchestrator:
             output, _ = proc.communicate(timeout=minutes * 60)
             code = proc.returncode
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            kill_group(proc)
             output, _ = proc.communicate()
             output = (output or "") + f"\n\nTIMEOUT: {label or 'command'} exceeded {minutes} min"
             code = -1
@@ -881,7 +910,7 @@ class Orchestrator:
             return
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
-                os.killpg(proc.pid, sig)
+                kill_group(proc, sig)
                 proc.wait(timeout=20)
                 return
             except subprocess.TimeoutExpired:
@@ -898,11 +927,8 @@ class Orchestrator:
                 proc.wait(timeout=600)
             except subprocess.TimeoutExpired:
                 log("WARN the e2e down command did not finish within 10 min — killing it")
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
-                except (ProcessLookupError, OSError):
-                    pass
+                kill_group(proc)
+                proc.wait()
         self._kill_surface_proc()
 
     def run_e2e(self, pdir: Path):

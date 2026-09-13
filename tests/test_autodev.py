@@ -367,6 +367,43 @@ class ReadOnlySessions(TempCwd):
                          {" M app/views.py", "?? notes.md"})
 
 
+class Interruption(TempCwd):
+    """What survives a stop: the resume handle on disk, nothing else still running."""
+
+    def orch(self):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        Path(".autodev").mkdir(exist_ok=True)
+        return autodev.Orchestrator(state)
+
+    def test_the_resume_handle_reaches_disk_while_the_session_runs(self):
+        """Regression: it lived in memory until the next save, so a SIGKILL lost it."""
+        o = self.orch()
+        o.note_session("p01-plan", "sess-123")
+        on_disk = json.loads(Path(".autodev/state.json").read_text())
+        self.assertEqual(on_disk["active_session"], {"label": "p01-plan", "session_id": "sess-123"})
+
+    def test_killing_a_session_takes_what_it_started_with_it(self):
+        """A session starts test runs and dev servers; only killing claude leaves them holding ports."""
+        proc = subprocess.Popen("sleep 60 & echo $!; sleep 60", shell=True, stdout=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        self.addCleanup(lambda: autodev.kill_group(proc))
+        child = int(proc.stdout.readline())
+        autodev.kill_group(proc)
+        proc.wait(timeout=10)
+        for _ in range(40):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"the process the session started (pid {child}) is still running")
+
+    def test_killing_a_process_that_is_already_gone_is_not_an_error(self):
+        proc = subprocess.Popen(["true"], start_new_session=True)
+        proc.wait()
+        autodev.kill_group(proc)          # must not raise
+
+
 class RunEntry(TempCwd):
     """What `run` does before the orchestrator starts: the archive, the resume, the base branch."""
 

@@ -136,7 +136,10 @@ the next attempt happens after the next phase.
 ## Control
 
 - status: `autodev.py status` · log: `tail -f .autodev/autodev.log` · e2e services: `.autodev/logs/e2e-surfaces.log`
-- stop after the current session: `touch .autodev/STOP` · immediately: Ctrl-C (the session will be resumed on the next `run`)
+- stop after the current session: `touch .autodev/STOP` · immediately: Ctrl-C (the session will be resumed on the
+  next `run`; a second Ctrl-C kills the session's whole process group, so the tests and dev servers it started go
+  with it). The resume handle is written to `state.json` as soon as a session names itself, so even a power cut
+  costs the current session, not the step.
 - continue: the same `run` · start over: `run --fresh` (the previous `.autodev/` is archived next to it, and
   `INTAKE.md` — the answers from the pre-flight interview — is carried over into the new run)
 - the spec belongs to the run: a `--spec` that differs from the one being resumed is reported and ignored;
