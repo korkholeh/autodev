@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -54,6 +56,47 @@ def percent_used(info: dict):
     if util is None:
         return None
     return util * 100 if util < 1.0 else util
+
+
+_UNRESOLVED = object()
+_certifi_ctx = _UNRESOLVED
+_on_certifi = False
+
+
+def _certifi_context():
+    """A verifying context built on certifi's roots, or None when certifi is not installed.
+
+    Resolved once — neither answer changes inside a run."""
+    global _certifi_ctx
+    if _certifi_ctx is _UNRESOLVED:
+        try:
+            import certifi
+            _certifi_ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:  # noqa: BLE001  (no certifi, or a bundle that will not load)
+            _certifi_ctx = None
+    return _certifi_ctx
+
+
+def urlopen(req, timeout):
+    """urlopen, falling back to certifi's roots when the interpreter has none of its own.
+
+    A python.org build whose `Install Certificates.command` was never run ships an empty
+    `etc/openssl`, so its default context trusts nothing and every HTTPS call dies with
+    CERTIFICATE_VERIFY_FAILED — the usage API included, which then silently costs the run its
+    proactive ceiling. certifi carries the same public roots a browser does. This keeps
+    verification on; it only changes whose roots do the verifying, and only after the
+    interpreter's own store has already refused."""
+    global _on_certifi
+    if not _on_certifi:
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason, ssl.SSLCertVerificationError) or _certifi_context() is None:
+                raise
+            log("usage API: this interpreter trusts no CA; verifying against certifi instead "
+                "(run '/Applications/Python 3.x/Install Certificates.command' to fix it for good)")
+            _on_certifi = True
+    return urllib.request.urlopen(req, timeout=timeout, context=_certifi_context())
 
 
 class UsageGuard:
@@ -109,11 +152,16 @@ class UsageGuard:
             "Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20",
             "Accept": "application/json", "User-Agent": "autodev/1.0"})
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with urlopen(req, timeout=20) as r:
                 data = json.load(r)
         except Exception as e:  # noqa: BLE001
             if self.api_ok is not False:
-                log(f"WARN usage API unavailable ({e}); falling back to stream events / limit errors")
+                hint = ""
+                if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+                    hint = (" — no usable CA bundle; `pip install certifi` or run "
+                            "'/Applications/Python 3.x/Install Certificates.command'")
+                log(f"WARN usage API unavailable ({e}){hint}; "
+                    "falling back to stream events / limit errors")
             self.api_ok = False
             return
         self.api_ok = True

@@ -967,6 +967,66 @@ class Usage(unittest.TestCase):
         self.assertIsNone(usage.percent_used({"utilization": None}))
         self.assertIsNone(usage.percent_used({"utilization": "n/a"}))
 
+    # --- the TLS fallback ------------------------------------------------
+
+    @contextlib.contextmanager
+    def _opener(self, first, ctx_open=None):
+        """Swap urlopen underneath the module and reset the once-per-process fallback state."""
+        import ssl as _ssl
+        import urllib.request as _ur
+        calls = []
+
+        def fake(req, timeout, context=None):
+            calls.append(context)
+            if context is None:
+                if isinstance(first, Exception):
+                    raise first
+                return first
+            return ctx_open() if callable(ctx_open) else ctx_open
+
+        real, usage._on_certifi = _ur.urlopen, False
+        saved_ctx, usage._certifi_ctx = usage._certifi_ctx, _ssl.create_default_context()
+        _ur.urlopen = fake
+        try:
+            yield calls
+        finally:
+            _ur.urlopen, usage._certifi_ctx, usage._on_certifi = real, saved_ctx, False
+
+    def _verify_error(self):
+        import ssl as _ssl
+        import urllib.error as _ue
+        return _ue.URLError(_ssl.SSLCertVerificationError("unable to get local issuer certificate"))
+
+    def test_an_empty_trust_store_falls_back_to_certifi(self):
+        """Regression: a python.org build with no CA bundle killed the usage guard outright."""
+        with self._opener(self._verify_error(), ctx_open="payload") as calls:
+            self.assertEqual(usage.urlopen("req", timeout=1), "payload")
+            self.assertEqual(len(calls), 2)          # default first, then certifi
+            self.assertIsNone(calls[0])
+            self.assertIsNotNone(calls[1])
+
+    def test_the_fallback_is_decided_once_not_per_request(self):
+        with self._opener(self._verify_error(), ctx_open="payload") as calls:
+            usage.urlopen("req", timeout=1)
+            usage.urlopen("req", timeout=1)
+        self.assertEqual(len(calls), 3)              # one default attempt, never retried
+
+    def test_a_failure_that_is_not_about_certificates_is_not_retried(self):
+        import urllib.error as _ue
+        boom = _ue.URLError("connection refused")
+        with self._opener(boom) as calls:
+            with self.assertRaises(_ue.URLError):
+                usage.urlopen("req", timeout=1)
+        self.assertEqual(len(calls), 1)
+
+    def test_no_certifi_means_the_original_error_survives(self):
+        err = self._verify_error()
+        with self._opener(err) as calls:
+            usage._certifi_ctx = None                # certifi not installed
+            with self.assertRaises(type(err)):
+                usage.urlopen("req", timeout=1)
+        self.assertEqual(len(calls), 1)
+
     def test_event_values_are_forgotten_when_the_api_is_the_source(self):
         g = self.guard()
         g.observe({"rateLimitType": "five_hour", "utilization": 0.9, "resetsAt": time.time() + 60})
