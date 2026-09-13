@@ -277,6 +277,7 @@ class Orchestrator:
         self.supports_prompts_none = False
         self.claude_flags: set = set()
         self.held_back: list = []
+        self.tampering: list = []
         self.autonomy = ""
         self.github: GitHub | None = None
         self.push_mode = "never"
@@ -485,6 +486,38 @@ class Orchestrator:
             shutil.copyfile(src, prof_file)
             log(f"stack profile: {name} → {prof_file.as_posix()}")
 
+    @staticmethod
+    def guides_digest() -> dict:
+        """Fingerprint of the tool-owned guides in `.autodev/guides/`.
+
+        They are the instructions every session is handed, and nothing in a run is supposed to write
+        them. They are gitignored, so the working-tree check below cannot see them."""
+        out = {}
+        for f in sorted((AD / "guides").glob("*.md")):
+            try:
+                out[f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
+            except OSError:
+                pass
+        return out
+
+    def check_guides(self, label: str, before: dict) -> None:
+        """Put the guides back if the session rewrote them, and say so where a human will read it."""
+        after = self.guides_digest()
+        touched = sorted(n for n in set(before) | set(after) if before.get(n) != after.get(n))
+        if not touched:
+            return
+        self.install_guides()
+        self.event(label, "guides restored", "session wrote .autodev/guides/: " + ", ".join(touched))
+        self.record_decision(f"`{label}` changed the working guides ({', '.join(touched)}); they were "
+                             "restored from the skill, so later sessions read the originals.")
+        self.tampering.append(f"{label} changed .autodev/guides/ ({', '.join(touched)}) — restored")
+
+    @staticmethod
+    def worktree_marks() -> set:
+        """What git sees as changed, `.autodev/` aside — the orchestrator writes there itself."""
+        return {ln for ln in git("status", "--porcelain", "-uall", check=False).splitlines()
+                if ln.strip() and not ln[3:].lstrip('"').startswith(".autodev/")}
+
     def _on_signal(self, signum, _frame):
         if self.stop_flag:
             if self.child and self.child.poll() is None:
@@ -629,6 +662,14 @@ class Orchestrator:
         return CMD_CORRECTION.replace("{{problems}}", "\n".join(problems))
 
     def session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None):
+        """One logical step, with the guides it was handed checked afterwards (see `check_guides`)."""
+        guides = self.guides_digest()
+        try:
+            return self._session(label, prompt, model, schema, required_key, extra_disallowed, recheck)
+        finally:
+            self.check_guides(label, guides)
+
+    def _session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None):
         """Run one logical step to completion: handles limit pauses, resumes, nudges, restarts.
 
         `recheck` gets the structured output and returns a complaint to send back, or None. The
@@ -1112,9 +1153,18 @@ class Orchestrator:
         git("add", "-A")  # so `git diff <base>` also shows new files
         prev = (f"- Previous review: `{run.dir.as_posix()}/REVIEW-r{r - 1}.md` — check its blocker/major "
                 "findings were really fixed." if r > 1 else "")
+        marks = self.worktree_marks()
         res = self.session(f"{run.label}{r}", render("review", round=r, previous_review=prev, **run.common),
                            cfg["model_review"], REVIEW_SCHEMA, "verdict",
                            extra_disallowed=("Edit", "Write", "NotebookEdit"))
+        # Edit/Write are blocked for the reviewer, but Bash is not, and `sed -i` writes files all the
+        # same. The changes stay — undoing them could throw away a real fix — but they are never silent.
+        touched = sorted(p[3:] for p in self.worktree_marks() ^ marks)
+        if touched:
+            shown = ", ".join(touched[:5]) + (f" +{len(touched) - 5} more" if len(touched) > 5 else "")
+            self.event(f"{run.label}{r}", "touched the tree", f"review round {r} changed {shown}")
+            run.ctx["warnings"].append(f"review round {r} changed the working tree itself ({shown}); "
+                                       "those edits are part of this phase's commit, unreviewed")
         if "verdict" not in res:
             run.ctx["warnings"].append(f"review round {r} did not complete")
             return self.after_review(run.ph)
@@ -1231,8 +1281,9 @@ class Orchestrator:
         if run.ctx.get("warnings"):
             body += ["", "Warnings:"] + [f"- {w}" for w in run.ctx["warnings"]]
         sha = self.commit(f"autodev: phase {run.n:02d} — {run.ph['title']}", "\n".join(body))
-        if self.held_back:
-            run.ctx["warnings"] = run.ctx.get("warnings", []) + self.held_back
+        if self.held_back or self.tampering:
+            run.ctx["warnings"] = run.ctx.get("warnings", []) + self.held_back + self.tampering
+            self.tampering = []
         if sha:
             git("tag", "-f", f"{st['branch']}/phase-{run.n:02d}", check=False)
         run.ph.update(status="done", commit=sha, warnings=run.ctx.get("warnings", []), finished=ts())

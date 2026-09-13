@@ -177,6 +177,17 @@ in the sessions: check that they do not block large changes (e.g. PR size limits
 only inside Docker or a VM. Never run e2e against production: `--e2e-up-cmd` must bring up local services with
 test data.
 
+**The review step is checked for read-only behaviour.** The reviewer session runs without `Edit`, `Write` and
+`NotebookEdit`, but it keeps `Bash`, and `sed -i` writes files all the same. So the working tree is fingerprinted
+(`git status --porcelain`, `.autodev/` aside) before and after the review: anything it changed is named in the log
+and in the phase's warnings, because those edits ride along in the phase commit without having been reviewed. The
+changes are not undone — a reviewer that fixed a real bug should not have the fix thrown away — only reported.
+
+**The working guides are restored if a session rewrites them.** `.autodev/guides/` is the instruction set every
+session reads, it is gitignored, so the tree check above cannot see it. Its files are hashed around every session;
+one that wrote to them gets them replaced from the skill before the next session starts, and the phase carries a
+warning naming the files.
+
 **Commit hooks are not bypassed.** A pre-commit hook is this repository's own check — usually the secret scanner
 or the lint gate — so a hook that rejects a commit stops the run instead of being worked around. The one case
 handled automatically is a hook that reformats files and then fails: what it wrote is restaged and committed once.
