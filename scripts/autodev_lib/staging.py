@@ -11,6 +11,7 @@ it stops showing up as a staged change.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -27,6 +28,38 @@ JUNK_PATHS = re.compile(
 COMMAND_FILES = re.compile(
     r"(^|/)(GNUmakefile|[Mm]akefile|[Jj]ustfile|Taskfile\.ya?ml|package\.json|pyproject\.toml|"
     r"noxfile\.py|tox\.ini|Rakefile|[Mm]ake\.bat|docker-compose\.ya?ml|compose\.ya?ml)$")
+
+# A manifest is mostly dependencies, and a dependency is not a command: in an npm or uv project the
+# manifest changes almost every phase, so naming the file every time would bury the one change worth
+# seeing. These two are read more closely (see command_change); the rest of COMMAND_FILES is nothing
+# but commands, so any change to them counts.
+PYPROJECT_COMMAND_LINE = re.compile(
+    r"^[+-](?![+-])\s*(?:\[[^\]]*(?:scripts|entry[-_]points|pytest|ruff|nox|tox)[^\]]*\]|"
+    r"(?:addopts|commands|scripts|entry[-_]points|testpaths|session)\s*=)", re.I)
+
+
+def scripts_of(text: str) -> dict:
+    """The `scripts` table of a package.json, or {} when there is none to read."""
+    try:
+        data = json.loads(text or "{}")
+    except ValueError:
+        return {"__unreadable__": text or ""}
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def command_change(path: str, before: str, after: str, diff: str) -> bool:
+    """Whether this staged file changed what the project's commands run.
+
+    `before`/`after` are the file as HEAD has it and as the index has it; `diff` is the staged diff
+    for that one path. A file that holds nothing but commands needs neither."""
+    name = path.rsplit("/", 1)[-1]
+    if name == "package.json":
+        return scripts_of(before) != scripts_of(after)
+    if name == "pyproject.toml":
+        return any(PYPROJECT_COMMAND_LINE.search(line) for line in (diff or "").splitlines())
+    return True
+
 
 # names that normally hold credentials (a .env.example and friends are fine)
 SECRET_NAMES = re.compile(

@@ -190,8 +190,10 @@ itself — is written by the sessions as part of their work. That is not a hole 
 tool: an autodev run executes code its sessions wrote, all night, with your environment. The vetting keeps a
 proposed command in a predictable shape and catches the obvious `curl … | sh`; it is not a trust boundary. A
 commit that changes a file deciding what a command runs (`Makefile`, `justfile`, `package.json`, `pyproject.toml`,
-`Taskfile`, a compose file) is named in the timeline, so the morning read shows it. For a spec you did not write
-yourself, run the whole thing in a container or a VM.
+`Taskfile`, a compose file) is named in the timeline, so the morning read shows it — a manifest is read closely
+enough to tell a new dependency from a changed script, since `package.json` moves almost every phase and naming it
+every time would bury the one change that matters. For a spec you did not write yourself, run the whole thing in a
+container or a VM.
 
 A command that does not pass costs nothing in the normal case: the session is told which command was refused and
 why, and given one chance to correct it — usually by adding a `make` target or an npm script and returning that

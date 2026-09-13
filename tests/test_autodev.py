@@ -476,8 +476,53 @@ class ResumedBranch(TempCwd):
 class CommandFiles(TempCwd):
     """What a commit changes about the project's own commands is named, not forbidden."""
 
+    def repo_with(self, path, before, after):
+        """A repository where `path` is committed as `before` and staged as `after`."""
+        subprocess.run(["git", "init", "-q", "-b", "main", "."], check=True)
+        for k, v in (("user.email", "t@example.com"), ("user.name", "T")):
+            subprocess.run(["git", "config", k, v], check=True)
+        Path(path).write_text(before)
+        subprocess.run(["git", "add", "-A"], check=True)
+        subprocess.run(["git", "commit", "-qm", "first"], check=True)
+        Path(path).write_text(after)
+        subprocess.run(["git", "add", "-A"], check=True)
+        Path(".autodev").mkdir(exist_ok=True)
+        o = autodev.Orchestrator(autodev.new_state("spec.md", dict(autodev.DEFAULTS)))
+        o.note_command_files([path])
+        return o
+
+    def test_a_new_dependency_is_not_a_command_change(self):
+        """Regression: package.json moves almost every phase, and buried the change worth seeing."""
+        o = self.repo_with("package.json",
+                           '{"scripts": {"test": "vitest run"}, "dependencies": {"a": "^1.0.0"}}\n',
+                           '{"scripts": {"test": "vitest run"}, "dependencies": {"a": "^1.0.0", "b": "^2"}}\n')
+        self.assertEqual(o.state["events"], [])
+
+    def test_a_changed_script_in_a_manifest_is(self):
+        o = self.repo_with("package.json",
+                           '{"scripts": {"test": "vitest run"}}\n',
+                           '{"scripts": {"test": "vitest run && ./tools/extra.sh"}}\n')
+        self.assertEqual(o.state["events"][-1]["status"], "command files")
+
+    def test_a_version_bump_in_pyproject_is_not(self):
+        o = self.repo_with("pyproject.toml",
+                           '[project]\nname = "x"\nversion = "0.1.0"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n',
+                           '[project]\nname = "x"\nversion = "0.2.0"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n')
+        self.assertEqual(o.state["events"], [])
+
+    def test_changed_pytest_options_in_pyproject_are(self):
+        o = self.repo_with("pyproject.toml",
+                           '[tool.pytest.ini_options]\naddopts = "-q"\n',
+                           '[tool.pytest.ini_options]\naddopts = "-q --no-cov -p no:randomly"\n')
+        self.assertEqual(o.state["events"][-1]["status"], "command files")
+
+    def test_any_change_to_a_makefile_counts(self):
+        o = self.repo_with("Makefile", "test:\n\tpytest -q\n", "test:\n\tpytest -q --cov\n")
+        self.assertEqual(o.state["events"][-1]["status"], "command files")
+
     def test_a_commit_that_changes_them_is_named_in_the_timeline(self):
-        Path(".autodev").mkdir()
+        subprocess.run(["git", "init", "-q", "."], check=True)
+        Path(".autodev").mkdir(exist_ok=True)
         o = autodev.Orchestrator(autodev.new_state("spec.md", dict(autodev.DEFAULTS)))
         o.note_command_files(["src/app.py", "Makefile", "README.md"])
         last = o.state["events"][-1]
@@ -486,7 +531,7 @@ class CommandFiles(TempCwd):
         self.assertNotIn("README.md", last["summary"])
 
     def test_a_commit_that_leaves_them_alone_says_nothing(self):
-        Path(".autodev").mkdir()
+        Path(".autodev").mkdir(exist_ok=True)
         o = autodev.Orchestrator(autodev.new_state("spec.md", dict(autodev.DEFAULTS)))
         o.note_command_files(["src/app.py", "tests/test_app.py"])
         self.assertEqual(o.state["events"], [])
@@ -670,6 +715,23 @@ class RunEntry(TempCwd):
                 claude_bin="/nonexistent-claude", profile=None, gh_host=None, gh_repo=None, remote=None))
         self.assertIn("no commits yet", out.getvalue())
         self.assertNotIn("detached HEAD", out.getvalue())
+
+    def test_doctor_says_when_head_is_not_on_the_run_s_branch(self):
+        subprocess.run(["git", "init", "-q", "-b", "main", "."], check=True)
+        for k, v in (("user.email", "t@example.com"), ("user.name", "T")):
+            subprocess.run(["git", "config", k, v], check=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "first"], check=True)
+        Path(".autodev").mkdir()
+        Path(".autodev/state.json").write_text(json.dumps(
+            {"run_id": "x", "config": {}, "spec": "spec.md", "status": "paused_limit", "step": "plan",
+             "phase_index": 2, "branch": "autodev/spec-1"}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            autodev.cmd_doctor(argparse.Namespace(
+                spec=None, gh_user=None, git_email=None, git_name=None, no_smoke=True,
+                claude_bin="/nonexistent-claude", profile=None, gh_host=None, gh_repo=None, remote=None))
+        self.assertIn("the run works on `autodev/spec-1`", out.getvalue())
+        self.assertIn("HEAD is on `main`", out.getvalue())
 
     def test_a_detached_head_stops_the_run_before_it_starts(self):
         autodev.git = lambda *a, **kw: "HEAD"

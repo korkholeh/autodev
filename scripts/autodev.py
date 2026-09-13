@@ -41,7 +41,7 @@ if str(_HERE) not in sys.path:              # so autodev_lib imports whether run
 
 from autodev_lib.commands import CMD_CORRECTION, CMD_FIELDS, command_allowed  # noqa: E402
 from autodev_lib.github import GitHub  # noqa: E402
-from autodev_lib.staging import COMMAND_FILES, why_not_committable  # noqa: E402
+from autodev_lib.staging import COMMAND_FILES, command_change, why_not_committable  # noqa: E402
 from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
 from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
                               STOP_FILE, SURFACE_LOG, StepFailed, StopRequested, atomic_write,
@@ -1022,8 +1022,14 @@ class Orchestrator:
 
         The vetting checks the shape of a command, not what it executes: `make test` runs whatever
         the Makefile says, and the Makefile is written by the sessions as part of their work. The
-        change cannot be forbidden — it is ordinary development — so it is named instead."""
-        touched = sorted(p for p in staged if COMMAND_FILES.search(p))
+        change cannot be forbidden — it is ordinary development — so it is named instead.
+
+        A manifest is read closely enough to tell a new dependency from a changed script: in an npm
+        or uv project package.json moves almost every phase, and naming it every time would bury the
+        one change that matters."""
+        touched = sorted(p for p in staged if COMMAND_FILES.search(p) and command_change(
+            p, git("show", f"HEAD:{p}", check=False), git("show", f":{p}", check=False),
+            git("diff", "--cached", "-U0", "--", p, check=False)))
         if touched:
             self.event("commit", "command files", "this commit changes what the project's own commands "
                        "run: " + ", ".join(touched[:6]))
@@ -1798,6 +1804,11 @@ def cmd_doctor(args) -> int:
         st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         rep("INFO", f"existing run: status={st['status']} step={st['step']} phase_index={st['phase_index']} "
                     "(run resumes it; --fresh starts over)")
+        branch, head = st.get("branch"), git("rev-parse", "--abbrev-ref", "HEAD", check=False)
+        if branch and head and head != branch:
+            rep("WARN", f"the run works on `{branch}`, HEAD is on "
+                        + (f"`{head}`" if head != "HEAD" else "a detached commit")
+                        + " — `run` checks it out again if the tree is clean, and stops if it is not")
         rep("OK" if owns_run(st.get("run_id") or "") else "WARN",
             "run state started on this machine" if owns_run(st.get("run_id") or "") else
             "run state was not started on this machine — `run` refuses it without --adopt")
