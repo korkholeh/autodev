@@ -1115,9 +1115,8 @@ class Orchestrator:
         d = self.phase_dir(i)
         lines = [f"**Phase {n} of {total}** — stacked on {below}"
                  + (f" · run: {st['pr_url']}" if st.get("pr_url") else ""), "",
-                 ph.get("goal") or "", "",
-                 "### Deliverables", "", bullets(ph.get("deliverables")), "",
-                 "### Acceptance criteria", "", bullets(ph.get("acceptance_criteria")), ""]
+                 ph.get("goal") or "", ""]
+        # What a reviewer needs first is what autodev already thinks is wrong with this phase.
         reviews = sorted(d.glob("REVIEW-r*.md"))
         if reviews:
             verdict = re.search(r"\*\*Verdict:\*\*\s*(.+)", reviews[-1].read_text(encoding="utf-8", errors="ignore"))
@@ -1125,6 +1124,13 @@ class Orchestrator:
                       f"{len(reviews)} round(s), last verdict: **{verdict.group(1).strip() if verdict else '?'}**", ""]
         if ph.get("warnings"):
             lines += ["### Warnings", "", bullets(ph["warnings"]), ""]
+        # The roadmap's own lists can run to dozens of lines; folded, they stay available without
+        # pushing the diff off the first screen.
+        for title, items in (("Deliverables", ph.get("deliverables")),
+                             ("Acceptance criteria", ph.get("acceptance_criteria"))):
+            if items:
+                lines += [f"<details><summary><b>{title}</b> ({len(items)})</summary>", "",
+                          bullets(items), "", "</details>", ""]
         lines += ["---", "",
                   f"Plan, reviews and test output: `{d.as_posix()}/` · commit `{ph.get('commit') or '—'}`", "",
                   "🤖 Written unattended by [autodev](https://github.com/korkholeh/autodev). "
@@ -1155,7 +1161,7 @@ class Orchestrator:
             ph["pr_branch"] = branch
             self.event(f"p{i + 1:02d}-push", "done", f"{self.github.repo}@{branch}")
             url = self.github.sync_pr(branch, below,
-                                      f"autodev {i + 1:02d}/{len(st['phases'])}: {ph['title']}",
+                                      f"autodev {i + 1:02d}/{len(st['phases']):02d}: {ph['title']}",
                                       self.phase_pr_body(i, below_url or f"`{below}`"))
             if url:
                 ph["pr_url"] = url
@@ -1167,9 +1173,10 @@ class Orchestrator:
         published = [(i + 1, ph) for i, ph in enumerate(self.state.get("phases") or []) if ph.get("pr_url")]
         if not published:
             return ""
+        total = len(self.state.get("phases") or [])
         lines = ["", "## Review it phase by phase", "",
-                 f"Each phase is a draft pull request based on the one below it, so they read "
-                 f"in order and merge bottom-up. This pull request is all {len(published)} together.", ""]
+                 "Each phase is a draft pull request based on the one below it, so they read in order and "
+                 f"merge bottom-up. This pull request carries all {len(published)} of {total} at once.", ""]
         for n, ph in published:
             lines.append(f"{n}. {ph['pr_url']} — {ph['title']}")
         return "\n".join(lines + [""])

@@ -1555,6 +1555,19 @@ class StackedPullRequests(TempCwd):
         o.publish_stack()
         self.assertIn("2 round(s), last verdict: **approved**", o.prs[0]["body"])
 
+    def test_long_roadmap_lists_are_folded_out_of_the_way(self):
+        """A phase's deliverables can run to dozens of lines; the diff has to stay on screen."""
+        o = self.orch([self.phase(1, deliverables=["d%d" % k for k in range(30)])])
+        o.publish_stack()
+        body = o.prs[0]["body"]
+        self.assertIn("<details><summary><b>Deliverables</b> (30)</summary>", body)
+        self.assertLess(body.index("<details>"), body.index("d0"))
+
+    def test_the_phase_number_and_the_total_are_padded_alike(self):
+        o = self.orch([self.phase(k) for k in range(1, 8)])
+        o.publish_stack()
+        self.assertTrue(o.prs[0]["title"].startswith("autodev 01/07:"), o.prs[0]["title"])
+
     def test_the_umbrella_lists_the_whole_chain(self):
         o = self.orch([self.phase(1), self.phase(2)])
         o.publish_stack()
