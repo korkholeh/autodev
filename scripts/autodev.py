@@ -1103,6 +1103,12 @@ class Orchestrator:
             return
         try:
             if self.github:
+                # Before the run branch, so a repository that starts empty gets its real default
+                # branch first rather than an autodev/... one.
+                if cfg.get("pr") and st.get("base_branch") not in (None, "", branch):
+                    if self.github.ensure_base(st["base_branch"]):
+                        self.event("push", "done", f"{self.github.repo}@{st['base_branch']} "
+                                                   "(base branch created for the pull request)")
                 self.github.push(branch)
                 where = f"{self.github.repo}@{branch} as {self.github.login}"
             else:
@@ -1750,6 +1756,13 @@ def cmd_doctor(args) -> int:
                             "add a remote or pass --gh-repo owner/name, otherwise push/PR are skipped")
             else:
                 rep("OK" if gh.can_push else "FAIL", f"gh: {repo} — push permission: {'yes' if gh.can_push else 'NO'}")
+                base = git("rev-parse", "--abbrev-ref", "HEAD", check=False)
+                if getattr(args, "pr", False) and gh.can_push and base and base != "HEAD":
+                    on_remote = gh.remote_has_branch(base)
+                    rep("OK" if on_remote else "INFO",
+                        f"gh: PR base branch {base} is on {repo}" if on_remote else
+                        f"gh: PR base branch {base} is not on {repo} yet — the run pushes it before "
+                        "the run branch, so the draft PR has a base to open against")
         except RuntimeError as e:
             rep("FAIL", f"gh: {e}")
     elif shutil.which("gh"):
@@ -1892,6 +1905,7 @@ def main() -> int:
     doc.add_argument("--gh-user", dest="gh_user")
     doc.add_argument("--gh-host", dest="gh_host")
     doc.add_argument("--gh-repo", dest="gh_repo")
+    doc.add_argument("--pr", action="store_true", help="check what the draft PR needs, as `run --pr` would")
     doc.add_argument("--remote")
     doc.add_argument("--git-name", dest="git_name")
     doc.add_argument("--git-email", dest="git_email")

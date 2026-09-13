@@ -73,7 +73,7 @@ class GitHub:
     def remote_url(self) -> str:
         return f"https://{self.host}/{self.repo}.git"
 
-    def push_command(self, branch: str) -> list:
+    def push_command(self, branch: str, src: str = "HEAD") -> list:
         """The push argv. The token lives in this process's environment, so nothing else may run here.
 
         A pre-push hook would run with that environment, and a hook is a file in the repository that
@@ -81,18 +81,45 @@ class GitHub:
         autodev has already run the suite before committing, so there is nothing for it to add."""
         return ["git", "-c", "credential.helper=", "-c", f"credential.https://{self.host}.helper=",
                 "-c", f"credential.helper={PUSH_HELPER}", "-c", "core.hooksPath=/dev/null",
-                "push", "--no-verify", self.remote_url(), f"HEAD:refs/heads/{branch}"]
+                "push", "--no-verify", self.remote_url(), f"{src}:refs/heads/{branch}"]
 
-    def push(self, branch: str) -> None:
+    def push(self, branch: str, src: str = "HEAD") -> None:
         env = {**os.environ, "AUTODEV_GH_LOGIN": self.login, "AUTODEV_GH_TOKEN": self.token,
                "GIT_TERMINAL_PROMPT": "0"}
-        r = subprocess.run(self.push_command(branch), capture_output=True, text=True, env=env, timeout=900)
+        r = subprocess.run(self.push_command(branch, src), capture_output=True, text=True, env=env, timeout=900)
         if r.returncode != 0:
             raise RuntimeError(one_line(r.stderr or r.stdout, 400))
+        if src != "HEAD":
+            return
         if self.repo_from_remote:  # keep `git status` / upstream tracking sane locally
             git("update-ref", f"refs/remotes/{self.remote}/{branch}", "HEAD", check=False)
             git("config", f"branch.{branch}.remote", self.remote, check=False)
             git("config", f"branch.{branch}.merge", f"refs/heads/{branch}", check=False)
+
+    def remote_has_branch(self, branch: str) -> bool:
+        return self.gh("api", f"repos/{self.repo}/branches/{branch}",
+                       "--jq", ".name", check=False) == branch
+
+    def ensure_base(self, base: str) -> str:
+        """Make sure the pull request's base branch exists on the remote. Returns what it did.
+
+        A repository autodev itself ran `git init` on has nothing on the remote, so the run branch
+        is the first thing pushed — which makes an `autodev/...` branch the default branch, and
+        leaves `gh pr create --base main` with no base to open against ("Base ref must be a
+        branch"). Every push step then fails the same way for the rest of the run.
+
+        The base is only ever created, never moved: an existing remote branch is left alone. And it
+        is created only when it is an ancestor of what is about to be pushed, so this publishes no
+        commit the run branch would not have published anyway."""
+        if not self.repo or not base or self.remote_has_branch(base):
+            return ""
+        if not git("rev-parse", "--verify", "-q", base, check=False):
+            return ""
+        if subprocess.run(["git", "merge-base", "--is-ancestor", base, "HEAD"],
+                          capture_output=True).returncode != 0:
+            return ""
+        self.push(base, src=base)
+        return base
 
     def sync_pr(self, branch: str, base: str, title: str, body_md: str) -> str:
         body_file = AD / "logs" / "pr_body.md"

@@ -58,7 +58,8 @@ This is the last human input of the run. Everything unasked becomes a logged gue
 - **A ceiling on the night** is worth offering: `--max-hours 8` (or `--max-sessions N`) stops the run
   instead of working through the next usage window. Without one the run goes until the spec is done.
 - Never point the e2e commands at production or at real user data.
-- **GitHub identity.** Commits/pushes use the account from `--gh-user <login>` (pass the same flag to `doctor`).
+- **GitHub identity.** Commits/pushes use the account from `--gh-user <login>` (pass the same flag to `doctor`,
+  together with `--pr` when the run will use it, so the base branch is checked too).
   If the user didn't pass it and the doctor lists several gh accounts while the repo has a GitHub remote,
   ask which account to use (or "local only"). A `FAIL` on push permission or a missing token must be fixed now
   (`gh auth login` for that account). Useful extras: `--pr` (draft PR with live PROGRESS.md), `--push end|never`,

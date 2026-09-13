@@ -1445,6 +1445,10 @@ class PushIsolation(TempCwd):
         self.assertIn("HEAD:refs/heads/autodev/x", argv)
         self.assertTrue(any("AUTODEV_GH_TOKEN" in a for a in argv))       # only via the helper
 
+    def test_a_source_ref_other_than_head_can_be_pushed(self):
+        argv = self.github("https://github.com/owner/repo.git").push_command("main", src="main")
+        self.assertIn("main:refs/heads/main", argv)
+
     def test_a_pre_push_hook_does_not_run(self):
         subprocess.run(["git", "init", "-q", "--bare", "remote.git"], check=True, capture_output=True)
         Path("work").mkdir()
@@ -1463,6 +1467,61 @@ class PushIsolation(TempCwd):
         branches = subprocess.run(["git", "--git-dir", "../remote.git", "branch"],
                                   capture_output=True, text=True).stdout
         self.assertIn("autodev/x", branches)
+
+
+class PullRequestBase(TempCwd):
+    """The draft PR needs its base branch on the remote, or every push step fails the same way."""
+
+    def github(self, on_remote=(), pushes=None):
+        gh = autodev.GitHub("me")
+        gh.token, gh.login, gh.repo = "token", "me", "owner/repo"
+        gh.remote_has_branch = lambda b: b in on_remote
+        gh.push = lambda branch, src="HEAD": pushes.append((branch, src))
+        return gh
+
+    def born(self):
+        for args in (["init", "-q", "."], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "T"]):
+            subprocess.run(["git", *args], check=True, capture_output=True)
+        Path("a.txt").write_text("one\n")
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "one"], check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-f", "base"], check=True, capture_output=True)
+
+    def test_a_base_missing_from_the_remote_is_created(self):
+        """Regression: after `git init`, the run branch was the first thing pushed, so an
+        autodev/… branch became the default branch and `gh pr create --base main` failed with
+        "Base ref must be a branch" — on every phase, for the rest of the run."""
+        self.born()
+        pushes = []
+        self.assertEqual(self.github(pushes=pushes).ensure_base("base"), "base")
+        self.assertEqual(pushes, [("base", "base")])
+
+    def test_a_base_already_on_the_remote_is_left_alone(self):
+        self.born()
+        pushes = []
+        self.assertEqual(self.github(on_remote=("base",), pushes=pushes).ensure_base("base"), "")
+        self.assertEqual(pushes, [])
+
+    def test_a_base_that_is_not_an_ancestor_is_never_published(self):
+        """What is about to be pushed already contains the base. A base holding anything else is
+        the user's to publish, not autodev's."""
+        self.born()
+        subprocess.run(["git", "checkout", "-q", "-b", "side"], check=True, capture_output=True)
+        Path("b.txt").write_text("two\n")
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "two"], check=True, capture_output=True)
+        subprocess.run(["git", "branch", "-f", "base", "HEAD"], check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-q", "--detach", "HEAD~1"], check=True, capture_output=True)
+        pushes = []
+        self.assertEqual(self.github(pushes=pushes).ensure_base("base"), "")
+        self.assertEqual(pushes, [])
+
+    def test_a_base_that_is_not_there_at_all_is_not_invented(self):
+        self.born()
+        pushes = []
+        self.assertEqual(self.github(pushes=pushes).ensure_base("nope"), "")
+        self.assertEqual(pushes, [])
 
 
 class HeadlessSmokeTest(unittest.TestCase):

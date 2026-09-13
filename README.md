@@ -109,7 +109,7 @@ from then on every session reads that file.
 | `--max-hours H`, `--max-sessions N` | ceiling on one run — it stops and tells you how to continue (no ceiling by default) |
 | `--gh-user LOGIN` | token via `gh auth token --user LOGIN`; the active gh account is **not switched** |
 | `--push phase\|end\|never` | when to push the `autodev/…` branch (with `--gh-user`, after every phase by default) |
-| `--pr` | draft PR into the base branch, body = the current `PROGRESS.md` (handy to watch from a phone) |
+| `--pr` | draft PR into the base branch, body = the current `PROGRESS.md` (handy to watch from a phone); the base branch is pushed first if the remote does not have it yet |
 | `--gh-repo owner/name` | repo, if the remote is not GitHub or there is none (`--remote` — a different remote name) |
 | `--git-name`, `--git-email` | override the author; by default the name from the profile + `ID+login@users.noreply.github.com` |
 | `--gh-host` | GitHub Enterprise (then `--git-email` is required) |
