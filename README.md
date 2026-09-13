@@ -68,7 +68,7 @@ Tests, e2e, commits, and state are handled by the script (no usage limit spent).
 | File | Purpose |
 |---|---|
 | `.autodev/HANDOFF.md` | morning briefing: what was done, what was verified, what is left, what a human must decide |
-| `.autodev/PROGRESS.md` | control document: status, phases, timeline, usage-limit consumption |
+| `.autodev/PROGRESS.md` | control document: status (and why it stopped), phases with their warnings, run warnings, timeline, usage |
 | `.autodev/ARCHITECTURE.md`, `RISKS.md` | design and risk register (architect step) |
 | `.autodev/ROADMAP.md` | phases with goal / deliverables / acceptance criteria / user_facing |
 | `.autodev/DECISIONS.md` | every decision the agents made on a human's behalf |
@@ -208,14 +208,16 @@ both end without a usable test command, the run fails there — minutes after la
 **What a session can reach.** Sessions run with `--permission-mode auto` (a classifier checks each action) and
 `--permission-prompts none`. On top of that, a session gets no `AUTODEV_*` variable from the environment (the
 usage token above all), no MCP server beyond the ones you name with `--mcp-config`, and no web access: `WebFetch`
-and `WebSearch` are blocked unless you pass `--web on`. The rest of the environment is inherited as it is — a
-session, and every test command, sees whatever the terminal you launched from had: `AWS_*`, `GH_TOKEN`,
-`KUBECONFIG`, cloud credentials. Launch an unattended run from a shell that carries only what the project needs. Web access is the one channel that reaches outside the
+and `WebSearch` are blocked unless you pass `--web on`. Web access is the one channel that reaches outside the
 repository, which is why an unattended run does without it by default — turn it on when the work needs to look
 something up. `--inherit-mcp` hands the sessions your own MCP servers instead. Hooks from `~/.claude` still run
 in the sessions: check that they do not block large changes (e.g. PR size limits). `--permission-mode bypass` —
 only inside Docker or a VM. Never run e2e against production: `--e2e-up-cmd` must bring up local services with
 test data.
+
+The rest of the environment is inherited as it is: a session — and every test command the orchestrator runs —
+sees whatever the terminal you launched from had, `AWS_*`, `GH_TOKEN`, `KUBECONFIG` and all. Start an unattended
+run from a shell that carries only what the project needs.
 
 **The review step is checked for read-only behaviour.** The reviewer session runs without `Edit`, `Write` and
 `NotebookEdit`, but it keeps `Bash`, and `sed -i` writes files all the same. So the working tree is fingerprinted
@@ -225,8 +227,9 @@ changes are not undone — a reviewer that fixed a real bug should not have the 
 
 **The working guides are restored if a session rewrites them.** `.autodev/guides/` is the instruction set every
 session reads, it is gitignored, so the tree check above cannot see it. Its files are hashed around every session;
-one that wrote to them gets them replaced from the skill before the next session starts, and the phase carries a
-warning naming the files.
+one that wrote to them gets them replaced from the skill before the next session starts, and the files are named
+under **Run warnings** in `PROGRESS.md` — a run warning rather than a phase warning, since the architect, roadmap
+and finalize steps have no phase to belong to.
 
 **Commit hooks are not bypassed.** A pre-commit hook is this repository's own check — usually the secret scanner
 or the lint gate — so a hook that rejects a commit stops the run instead of being worked around. The one case
@@ -257,7 +260,14 @@ start over with `--fresh`, or read `.autodev/state.json` and accept it deliberat
 - `scripts/autodev.py` — the entry point: the phase state machine, the sessions, git and the CLI. A phase step is
   a method named in `PHASE_STEPS` that does the work and returns the step the phase moves to.
 - `scripts/autodev_lib/` — the parts that stand on their own: `util.py` (paths, logging, git, helpers),
-  `commands.py` (which commands the orchestrator will run), `usage.py` (the limit guard), `github.py`.
+  `commands.py` (which commands the orchestrator will run, and how a container is fenced in), `staging.py` (what
+  must never reach a commit, and which files decide what a command runs), `usage.py` (the limit guard),
+  `github.py` (committing, pushing and the draft PR as one explicit account).
+- `tests/test_autodev.py` — 156 tests, stdlib only, nothing leaves the process: no session is started, no network
+  call is made. They cover what used to break silently — where a phase goes after each step, which commands the
+  orchestrator agrees to run, how a limit is read, when a run stops, and that a resumed run is on its own branch.
+  Run them with `python3 -m unittest discover -s tests` from the repository root; a change to the phase machine
+  without a test for its route is how C2 and C3 happened the first time.
 
 ## Tests
 
