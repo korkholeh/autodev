@@ -16,6 +16,46 @@ from .util import hm, log, to_epoch
 USAGE_ENDPOINT = os.environ.get("AUTODEV_USAGE_ENDPOINT", "https://api.anthropic.com/api/oauth/usage")
 RESET_BUFFER_S = int(os.environ.get("AUTODEV_RESET_BUFFER", "120"))
 
+PCT_KEYS = ("utilization_percent", "utilizationPercent", "percent_used", "percentUsed")
+USED_PAIRS = (("used", "limit"), ("used_tokens", "limit_tokens"), ("usedTokens", "limitTokens"))
+
+
+def _num(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def percent_used(info: dict):
+    """How much of a window is used, in percent, or None if the payload does not say.
+
+    `utilization` has been seen on both scales and the number alone cannot settle which: a 1 is
+    either one percent or a window that is full. So an unambiguous pair (used/limit) is read first,
+    then a field that names its own unit, and only then `utilization` — where a value below 1 is
+    taken as a fraction and anything else as a percentage already.
+
+    That leaves exactly 1 read as 1%. Being wrong that way costs one more request, and the limit
+    error it comes back with pauses the run anyway; being wrong the other way parks the night on a
+    window that was barely touched."""
+    if not isinstance(info, dict):
+        return None
+    for used_key, limit_key in USED_PAIRS:
+        used, limit = _num(info.get(used_key)), _num(info.get(limit_key))
+        if used is not None and limit is not None and limit > 0:
+            return used / limit * 100
+    for key in PCT_KEYS:
+        pct = _num(info.get(key))
+        if pct is not None:
+            return pct
+    util = _num(info.get("utilization"))
+    if util is None:
+        return None
+    return util * 100 if util < 1.0 else util
+
+
 class UsageGuard:
     """Tracks 5h / 7d utilization from the (undocumented) OAuth usage endpoint and from
     `rate_limit_event`s in the stream. Values are percentages 0..100."""
@@ -79,17 +119,16 @@ class UsageGuard:
         self.api_ok = True
         with self._lock:
             fh, sd = data.get("five_hour") or {}, data.get("seven_day") or {}
-            self.five = float(fh.get("utilization") or 0)
+            self.five = percent_used(fh) or 0.0
             self.five_reset = to_epoch(fh.get("resets_at"))
-            self.week = float(sd.get("utilization") or 0)
+            self.week = percent_used(sd) or 0.0
             self.week_reset = to_epoch(sd.get("resets_at"))
             self.rejected = False
 
     def observe(self, info: dict) -> None:
         with self._lock:
             kind = info.get("rateLimitType") or info.get("rate_limit_type")
-            util = info.get("utilization")
-            pct = None if util is None else (float(util) * 100 if float(util) <= 1.0 else float(util))
+            pct = percent_used(info)
             reset = to_epoch(info.get("resetsAt") or info.get("resets_at"))
             if kind in (None, "five_hour"):
                 if pct is not None:

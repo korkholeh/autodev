@@ -707,6 +707,32 @@ class Usage(unittest.TestCase):
         g.observe({"rateLimitType": "five_hour", "utilization": 90, "resetsAt": time.time() + 60})
         self.assertTrue(g.over()[0])
 
+    def test_a_fraction_is_read_as_a_fraction(self):
+        self.assertAlmostEqual(usage.percent_used({"utilization": 0.9}), 90)
+        self.assertAlmostEqual(usage.percent_used({"utilization": 0.0}), 0)
+
+    def test_a_percentage_is_left_alone(self):
+        self.assertAlmostEqual(usage.percent_used({"utilization": 87}), 87)
+
+    def test_a_bare_one_does_not_park_the_run_for_hours(self):
+        """Regression: `1` was read as a full window, so a 1%-used window paused the run."""
+        g = self.guard()
+        g.observe({"rateLimitType": "five_hour", "utilization": 1, "resetsAt": time.time() + 3600})
+        self.assertAlmostEqual(g.five, 1)
+        self.assertFalse(g.over()[0])
+
+    def test_an_unambiguous_pair_wins_over_utilization(self):
+        self.assertAlmostEqual(usage.percent_used({"used": 9, "limit": 10, "utilization": 1}), 90)
+        self.assertIsNone(usage.percent_used({"used": 9, "limit": 0}))
+
+    def test_a_field_that_names_its_unit_wins_over_utilization(self):
+        self.assertAlmostEqual(usage.percent_used({"utilization_percent": 42, "utilization": 0.9}), 42)
+
+    def test_nothing_usable_is_nothing(self):
+        self.assertIsNone(usage.percent_used({}))
+        self.assertIsNone(usage.percent_used({"utilization": None}))
+        self.assertIsNone(usage.percent_used({"utilization": "n/a"}))
+
     def test_event_values_are_forgotten_when_the_api_is_the_source(self):
         g = self.guard()
         g.observe({"rateLimitType": "five_hour", "utilization": 0.9, "resetsAt": time.time() + 60})

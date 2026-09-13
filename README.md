@@ -159,7 +159,10 @@ sleeping into a morning nobody asked for.
 Before every session, and every 5 minutes during one, the script reads the 5h/7d utilization. At ≥85% it sends
 SIGINT to the current session, sleeps until the reset (+2 min), then `--resume`s the same session. Sources: the
 undocumented `api/oauth/usage` (token from `~/.claude/.credentials.json` or the macOS Keychain) +
-`rate_limit_event` in stream-json + the text of the limit error. For a non-standard `CLAUDE_CONFIG_DIR` on macOS:
+`rate_limit_event` in stream-json + the text of the limit error. A utilization figure is read from the payload
+that states its scale — a used/limit pair, or a field that names its unit — and only then from `utilization`,
+where a value below 1 is a fraction; a bare `1` is taken as one percent, because a wrong pause costs the night
+while a wrong request is caught by the limit error it comes back with. For a non-standard `CLAUDE_CONFIG_DIR` on macOS:
 `AUTODEV_KEYCHAIN_SERVICE="<the Keychain entry name>"`.
 
 ## Security
