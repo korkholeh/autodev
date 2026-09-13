@@ -41,7 +41,7 @@ if str(_HERE) not in sys.path:              # so autodev_lib imports whether run
 
 from autodev_lib.commands import CMD_CORRECTION, CMD_FIELDS, command_allowed  # noqa: E402
 from autodev_lib.github import GitHub  # noqa: E402
-from autodev_lib.staging import why_not_committable  # noqa: E402
+from autodev_lib.staging import COMMAND_FILES, why_not_committable  # noqa: E402
 from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
 from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
                               STOP_FILE, SURFACE_LOG, StepFailed, StopRequested, atomic_write,
@@ -475,6 +475,8 @@ class Orchestrator:
             if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode != 0:
                 git("commit", "-q", "-m", "autodev: snapshot before autonomous run")
                 log("committed pre-run snapshot of uncommitted changes")
+        else:
+            self.ensure_on_branch(st["branch"])
 
         st.setdefault("run_base_sha", git("rev-parse", "HEAD"))
         self.push_mode = cfg.get("push") or "auto"
@@ -495,6 +497,33 @@ class Orchestrator:
         st["status"] = "running"
         st.pop("error", None)
         self.save()
+
+    def ensure_on_branch(self, branch: str) -> None:
+        """Put a resumed run back on its own branch before it commits anything.
+
+        A run that paused overnight is continued by the same command in the morning, in a repository
+        the developer may have used in between. Nothing else looks: `git add -A` and the phase commit
+        would land wherever HEAD happens to be, the phase tag would point there, and the push would
+        send that to the run's branch."""
+        cur = git("rev-parse", "--abbrev-ref", "HEAD", check=False)
+        if cur == branch:
+            return
+        where = f"branch {cur}" if cur and cur != "HEAD" else "a detached HEAD"
+        if not git("rev-parse", "--verify", "-q", f"refs/heads/{branch}", check=False):
+            raise StepFailed(f"the branch this run works on (`{branch}`) no longer exists in this "
+                             f"repository, and HEAD is on {where}. Restore the branch, or start over "
+                             "with --fresh.")
+        dirty = [ln for ln in git("status", "--porcelain", check=False).splitlines()
+                 if ln.strip() and not ln[3:].lstrip('"').startswith(".autodev/")]
+        if dirty:
+            raise StepFailed(
+                f"this run works on `{branch}`, but HEAD is on {where} with {len(dirty)} uncommitted "
+                "change(s). Those are not the run's, so autodev does not move or commit them: deal "
+                f"with them, check out `{branch}` yourself, and run the same command again.")
+        git("checkout", "-q", branch)
+        log(f"switched back to the run's branch {branch} (HEAD was on {where})")
+        self.record_decision(f"resumed on {where}; checked out the run's branch `{branch}` again "
+                             "before committing anything")
 
     def install_guides(self) -> None:
         """Copy the working guides and the chosen stack profile into .autodev/ for the sessions to read.
@@ -970,14 +999,26 @@ class Orchestrator:
         log(f"running e2e: {cmd}")
         return self._shell(cmd, self.cfg["e2e_timeout"], pdir / "E2E_OUTPUT.txt", "e2e suite")
 
-    def guard_staged(self) -> list:
+    def note_command_files(self, staged) -> None:
+        """Say when a commit changes a file that decides what the project's commands actually run.
+
+        The vetting checks the shape of a command, not what it executes: `make test` runs whatever
+        the Makefile says, and the Makefile is written by the sessions as part of their work. The
+        change cannot be forbidden — it is ordinary development — so it is named instead."""
+        touched = sorted(p for p in staged if COMMAND_FILES.search(p))
+        if touched:
+            self.event("commit", "command files", "this commit changes what the project's own commands "
+                       "run: " + ", ".join(touched[:6]))
+
+    def guard_staged(self, staged=None) -> list:
         """Take back out of the index anything that must not be committed automatically.
 
         `git add -A` cannot tell a phase's work from whatever else a session left in the tree, and
         with --pr the difference reaches GitHub the same night. A held-back file stays on disk and is
         reported; committing it yourself is what tells autodev it belongs here."""
         limit = int(self.cfg.get("max_file_mb") or 0) * 1048576
-        staged = git("diff", "--cached", "--name-only", "--diff-filter=ACMR", check=False).splitlines()
+        if staged is None:
+            staged = git("diff", "--cached", "--name-only", "--diff-filter=ACMR", check=False).splitlines()
         blocked = [(p, why_not_committable(Path(p), limit)) for p in staged if p]
         blocked = [(p, why) for p, why in blocked if why]
         for path, why in blocked:
@@ -1002,7 +1043,10 @@ class Orchestrator:
                                   capture_output=True, text=True)
 
         git("add", "-A")
-        self.held_back = self.guard_staged()
+        staged = [p for p in git("diff", "--cached", "--name-only", "--diff-filter=ACMR",
+                                 check=False).splitlines() if p]
+        self.held_back = self.guard_staged(staged)
+        self.note_command_files(staged)
         if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
             return None
         before = git("status", "--porcelain", check=False)

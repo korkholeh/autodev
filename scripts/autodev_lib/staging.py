@@ -21,6 +21,13 @@ JUNK_PATHS = re.compile(
     r"target/(debug|release)|dist-newstyle|playwright-report|test-results|\.DS_Store|"
     r"e2e/(artifacts|screenshots|traces))(/|$)")
 
+# files that decide what `make test` (or `npm test`, or `just e2e`) actually runs. A session writes
+# them as part of its work, and the command vetting only checks the shape of the command it is given,
+# so a change here is named in the timeline rather than forbidden.
+COMMAND_FILES = re.compile(
+    r"(^|/)(GNUmakefile|[Mm]akefile|[Jj]ustfile|Taskfile\.ya?ml|package\.json|pyproject\.toml|"
+    r"noxfile\.py|tox\.ini|Rakefile|[Mm]ake\.bat|docker-compose\.ya?ml|compose\.ya?ml)$")
+
 # names that normally hold credentials (a .env.example and friends are fine)
 SECRET_NAMES = re.compile(
     r"(^|/)(\.env(\.(?!example|sample|template|dist)[\w-]+)?|\.netrc|\.npmrc|\.pypirc|"

@@ -146,6 +146,9 @@ the next attempt happens after the next phase.
 - the spec belongs to the run: a `--spec` that differs from the one being resumed is reported and ignored;
   `--fresh` is how you change it
 - the run needs a branch to start from, so a detached HEAD stops it before the first session (`doctor` says so too)
+- a resumed run puts itself back on its own branch first: if you left the repository on another branch (or on a
+  detached HEAD) it checks the run's branch out again, and if there are uncommitted changes that are not the
+  run's, it stops and leaves them alone
 
 ## Usage limits
 
@@ -174,6 +177,15 @@ something else. A proposed command is accepted only when every segment starts wi
 (`make`, `uv`, `pytest`, `npm`, `cargo`, `swift`, `xcodebuild`, `go`, `cmake`, `gradle`, `docker`, …) and nothing
 in it fetches or evaluates code, escalates privileges, or redirects outside the repository. Commands **you** pass
 (`--test-cmd`, `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`) are used as typed and never checked.
+
+**What the vetting does not cover.** It checks the shape of a command, not what the command runs: `make test`
+runs whatever the `Makefile` says, and the `Makefile` — like `package.json`, the test suite and the application
+itself — is written by the sessions as part of their work. That is not a hole to be closed but the nature of the
+tool: an autodev run executes code its sessions wrote, all night, with your environment. The vetting keeps a
+proposed command in a predictable shape and catches the obvious `curl … | sh`; it is not a trust boundary. A
+commit that changes a file deciding what a command runs (`Makefile`, `justfile`, `package.json`, `pyproject.toml`,
+`Taskfile`, a compose file) is named in the timeline, so the morning read shows it. For a spec you did not write
+yourself, run the whole thing in a container or a VM.
 
 A command that does not pass costs nothing in the normal case: the session is told which command was refused and
 why, and given one chance to correct it — usually by adding a `make` target or an npm script and returning that

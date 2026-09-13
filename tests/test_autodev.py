@@ -404,6 +404,99 @@ class Interruption(TempCwd):
         autodev.kill_group(proc)          # must not raise
 
 
+class ResumedBranch(TempCwd):
+    """A run continued the next morning must be on its own branch before it commits."""
+
+    def repo(self, branch="autodev/spec-1"):
+        subprocess.run(["git", "init", "-q", "-b", "main", "."], check=True)
+        for k, v in (("user.email", "t@example.com"), ("user.name", "T")):
+            subprocess.run(["git", "config", k, v], check=True)
+        Path("a.txt").write_text("one\n")
+        subprocess.run(["git", "add", "-A"], check=True)
+        subprocess.run(["git", "commit", "-qm", "first"], check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", branch], check=True)
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state["branch"] = branch
+        Path(".autodev").mkdir(exist_ok=True)
+        return autodev.Orchestrator(state)
+
+    @staticmethod
+    def head():
+        return subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_already_on_the_branch_is_a_no_op(self):
+        o = self.repo()
+        o.ensure_on_branch("autodev/spec-1")
+        self.assertEqual(self.head(), "autodev/spec-1")
+
+    def test_a_branch_switched_in_between_is_switched_back(self):
+        """Regression: the phase commit landed wherever HEAD was, and the push sent it on."""
+        o = self.repo()
+        subprocess.run(["git", "checkout", "-q", "main"], check=True)
+        o.ensure_on_branch("autodev/spec-1")
+        self.assertEqual(self.head(), "autodev/spec-1")
+        self.assertIn("autodev/spec-1", Path(".autodev/DECISIONS.md").read_text())
+
+    def test_a_detached_head_is_switched_back_too(self):
+        o = self.repo()
+        subprocess.run(["git", "checkout", "-q", "--detach"], check=True)
+        o.ensure_on_branch("autodev/spec-1")
+        self.assertEqual(self.head(), "autodev/spec-1")
+
+    def test_uncommitted_work_that_is_not_the_run_s_stops_it(self):
+        o = self.repo()
+        subprocess.run(["git", "checkout", "-q", "main"], check=True)
+        Path("mine.txt").write_text("half a thought\n")
+        with self.assertRaises(util.StepFailed) as e:
+            o.ensure_on_branch("autodev/spec-1")
+        self.assertIn("uncommitted", str(e.exception))
+        self.assertEqual(self.head(), "main")        # nothing was moved
+
+    def test_the_orchestrator_own_files_do_not_count_as_dirty(self):
+        o = self.repo()
+        subprocess.run(["git", "checkout", "-q", "main"], check=True)
+        Path(".autodev/PROGRESS.md").write_text("# progress\n")
+        o.ensure_on_branch("autodev/spec-1")
+        self.assertEqual(self.head(), "autodev/spec-1")
+
+    def test_a_branch_that_is_gone_stops_the_run(self):
+        o = self.repo()
+        subprocess.run(["git", "checkout", "-q", "main"], check=True)
+        subprocess.run(["git", "branch", "-qD", "autodev/spec-1"], check=True)
+        with self.assertRaises(util.StepFailed) as e:
+            o.ensure_on_branch("autodev/spec-1")
+        self.assertIn("--fresh", str(e.exception))
+
+
+class CommandFiles(TempCwd):
+    """What a commit changes about the project's own commands is named, not forbidden."""
+
+    def test_a_commit_that_changes_them_is_named_in_the_timeline(self):
+        Path(".autodev").mkdir()
+        o = autodev.Orchestrator(autodev.new_state("spec.md", dict(autodev.DEFAULTS)))
+        o.note_command_files(["src/app.py", "Makefile", "README.md"])
+        last = o.state["events"][-1]
+        self.assertEqual(last["status"], "command files")
+        self.assertIn("Makefile", last["summary"])
+        self.assertNotIn("README.md", last["summary"])
+
+    def test_a_commit_that_leaves_them_alone_says_nothing(self):
+        Path(".autodev").mkdir()
+        o = autodev.Orchestrator(autodev.new_state("spec.md", dict(autodev.DEFAULTS)))
+        o.note_command_files(["src/app.py", "tests/test_app.py"])
+        self.assertEqual(o.state["events"], [])
+
+    def test_the_files_that_decide_what_a_command_runs(self):
+        for name in ("Makefile", "sub/Makefile", "justfile", "package.json", "pyproject.toml",
+                     "Taskfile.yml", "noxfile.py", "docker-compose.yaml"):
+            self.assertTrue(staging.COMMAND_FILES.search(name), name)
+
+    def test_ordinary_files_are_not(self):
+        for name in ("src/app.py", "README.md", "package-lock.json", "Makefile.md"):
+            self.assertIsNone(staging.COMMAND_FILES.search(name), name)
+
+
 class Budget(TempCwd):
     """The ceiling on a single run: the usage guard only keeps the subscription happy."""
 
