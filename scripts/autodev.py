@@ -12,7 +12,7 @@ progress tracking are done deterministically by this script. The run pauses when
   autodev.py status                    short status of the run in the current repo
 
 GitHub: `--gh-user LOGIN` commits and pushes as that gh account (token via `gh auth token --user`,
-never switching gh's active account); `--pr` keeps a draft PR with PROGRESS.md as its body.
+never switching gh's active account); `--pr` keeps a draft PR per phase, stacked, plus one for the whole run.
 
 Stdlib only, Python 3.9+.
 """
@@ -99,7 +99,7 @@ DEFAULTS = {
     "git_name": "",       # override commit author name (default: GitHub profile name)
     "git_email": "",      # override commit email (default: <id>+<login>@users.noreply.github.com)
     "push": "auto",       # phase | end | never; auto = phase when gh_user is set, else never
-    "pr": False,          # create/update a draft PR (requires gh_user)
+    "pr": "",             # "" off · "stacked" a draft PR per phase + one for the run · "single" just the run's
 }
 
 ARCH_SCHEMA = {
@@ -501,7 +501,7 @@ class Orchestrator:
                 self.push_mode = "never"
             else:
                 log(f"GitHub: acting as {self.github.login} → {repo} (push: {self.push_mode}"
-                    + (", draft PR" if cfg.get("pr") else "") + ")")
+                    + (f", draft PR ({self.pr_mode()})" if self.pr_mode() else "") + ")")
         st["status"] = "running"
         st.pop("error", None)
         self.save()
@@ -1093,6 +1093,87 @@ class Orchestrator:
                 "-m", body + "\n\n[autodev] commit hooks failed; committed with --no-verify")
         return git("rev-parse", "--short", "HEAD")
 
+    def pr_mode(self) -> str:
+        """"stacked", "single", or "" — `pr: true` in an older state.json means what --pr means now."""
+        mode = self.cfg.get("pr")
+        if mode is True:
+            return "stacked"
+        return mode if mode in ("stacked", "single") else ""
+
+    def phase_branch(self, i: int) -> str:
+        ph = self.state["phases"][i]
+        return f"{self.state['branch']}-p{i + 1:02d}-{ph['slug']}"
+
+    def phase_pr_body(self, i: int, below: str) -> str:
+        """One phase's pull request: what it was asked to do, and what came back.
+
+        Everything here is already on disk by the time the phase is done, so the body is written
+        once and never needs revisiting — the live view of the whole run belongs to the umbrella
+        pull request, which is synced on every push anyway."""
+        st = self.state
+        ph, n, total = st["phases"][i], i + 1, len(st["phases"])
+        d = self.phase_dir(i)
+        lines = [f"**Phase {n} of {total}** — stacked on {below}"
+                 + (f" · run: {st['pr_url']}" if st.get("pr_url") else ""), "",
+                 ph.get("goal") or "", "",
+                 "### Deliverables", "", bullets(ph.get("deliverables")), "",
+                 "### Acceptance criteria", "", bullets(ph.get("acceptance_criteria")), ""]
+        reviews = sorted(d.glob("REVIEW-r*.md"))
+        if reviews:
+            verdict = re.search(r"\*\*Verdict:\*\*\s*(.+)", reviews[-1].read_text(encoding="utf-8", errors="ignore"))
+            lines += [f"### Review", "",
+                      f"{len(reviews)} round(s), last verdict: **{verdict.group(1).strip() if verdict else '?'}**", ""]
+        if ph.get("warnings"):
+            lines += ["### Warnings", "", bullets(ph["warnings"]), ""]
+        lines += ["---", "",
+                  f"Plan, reviews and test output: `{d.as_posix()}/` · commit `{ph.get('commit') or '—'}`", "",
+                  "🤖 Written unattended by [autodev](https://github.com/korkholeh/autodev). "
+                  "Review it as you would any other pull request."]
+        return "\n".join(lines)
+
+    def publish_stack(self) -> None:
+        """One draft PR per finished phase, each based on the phase below it.
+
+        The run's history is already linear — one commit per phase — so the stack needs no rebasing
+        and no extra branches locally: each phase branch is that phase's commit pushed under its own
+        name. A phase is published once and then left alone; its commit cannot change afterwards.
+
+        A phase that changed nothing has no commit to open a pull request for, so the next phase
+        stacks on whatever was last published instead, and the chain stays unbroken."""
+        st = self.state
+        below, below_url = st.get("base_branch"), ""
+        for i, ph in enumerate(st.get("phases") or []):
+            if ph.get("status") != "done" or not ph.get("commit"):
+                continue
+            if ph.get("pr_branch"):                      # already published — just carry the chain on
+                below, below_url = ph["pr_branch"], ph.get("pr_url") or below_url
+                continue
+            if not below or below == st["branch"]:
+                return
+            branch = self.phase_branch(i)
+            self.github.push(branch, src=ph["commit"])
+            ph["pr_branch"] = branch
+            self.event(f"p{i + 1:02d}-push", "done", f"{self.github.repo}@{branch}")
+            url = self.github.sync_pr(branch, below,
+                                      f"autodev {i + 1:02d}/{len(st['phases'])}: {ph['title']}",
+                                      self.phase_pr_body(i, below_url or f"`{below}`"))
+            if url:
+                ph["pr_url"] = url
+                self.event(f"p{i + 1:02d}-pr", "draft", url)
+            below, below_url = branch, url or below_url
+
+    def stack_map(self) -> str:
+        """The chain, for the umbrella pull request — the one body that is rewritten every push."""
+        published = [(i + 1, ph) for i, ph in enumerate(self.state.get("phases") or []) if ph.get("pr_url")]
+        if not published:
+            return ""
+        lines = ["", "## Review it phase by phase", "",
+                 f"Each phase is a draft pull request based on the one below it, so they read "
+                 f"in order and merge bottom-up. This pull request is all {len(published)} together.", ""]
+        for n, ph in published:
+            lines.append(f"{n}. {ph['pr_url']} — {ph['title']}")
+        return "\n".join(lines + [""])
+
     def publish(self, final: bool = False) -> None:
         """Push the branch (and sync the draft PR). Never raises: failures are logged and retried next time."""
         if self.push_mode == "never" or (self.push_mode == "end" and not final):
@@ -1105,7 +1186,7 @@ class Orchestrator:
             if self.github:
                 # Before the run branch, so a repository that starts empty gets its real default
                 # branch first rather than an autodev/... one.
-                if cfg.get("pr") and st.get("base_branch") not in (None, "", branch):
+                if self.pr_mode() and st.get("base_branch") not in (None, "", branch):
                     if self.github.ensure_base(st["base_branch"]):
                         self.event("push", "done", f"{self.github.repo}@{st['base_branch']} "
                                                    "(base branch created for the pull request)")
@@ -1119,13 +1200,25 @@ class Orchestrator:
                 where = f"{cfg['remote']}/{branch}"
             self.event("push", "done", where)
             base = st.get("base_branch")
-            if cfg.get("pr") and self.github and base and base != branch:
+            if self.pr_mode() and self.github and base and base != branch:
                 self.render_progress()
-                url = self.github.sync_pr(branch, base, f"autodev: {(st.get('project') or {}).get('name') or branch}",
-                                          (AD / "PROGRESS.md").read_text(encoding="utf-8"))
+                title = f"autodev: {(st.get('project') or {}).get('name') or branch}"
+                def umbrella(map_md):
+                    return self.github.sync_pr(branch, base, title,
+                                               (AD / "PROGRESS.md").read_text(encoding="utf-8") + map_md)
+                # The umbrella goes first so the phase pull requests can link back to it, and is
+                # rewritten afterwards with the phases this push added. Two calls, but only on a
+                # push that actually extended the stack.
+                was = self.stack_map()
+                url = umbrella(was)
                 if url and st.get("pr_url") != url:
                     st["pr_url"] = url
                     self.event("pr", "draft", url)
+                if self.pr_mode() == "stacked":
+                    self.publish_stack()
+                    now = self.stack_map()
+                    if now != was:
+                        umbrella(now)
         except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError) as e:
             self.event("push", "failed", str(e))
 
@@ -1893,7 +1986,9 @@ def main() -> int:
     run.add_argument("--git-name", dest="git_name", help="commit author name override")
     run.add_argument("--git-email", dest="git_email", help="commit email override")
     run.add_argument("--push", choices=["phase", "end", "never"], help="default: phase with --gh-user, else never")
-    run.add_argument("--pr", action="store_const", const=True, help="keep a draft PR updated with PROGRESS.md")
+    run.add_argument("--pr", nargs="?", const="stacked", choices=("stacked", "single"), default=None,
+                     help="draft PRs: `stacked` (default) opens one per phase, each based on the phase "
+                          "below it, plus one for the whole run; `single` opens only the run's own")
     run.set_defaults(func=cmd_run)
 
     doc = sub.add_parser("doctor", help="pre-flight checks")
@@ -1905,7 +2000,7 @@ def main() -> int:
     doc.add_argument("--gh-user", dest="gh_user")
     doc.add_argument("--gh-host", dest="gh_host")
     doc.add_argument("--gh-repo", dest="gh_repo")
-    doc.add_argument("--pr", action="store_true", help="check what the draft PR needs, as `run --pr` would")
+    doc.add_argument("--pr", action="store_true", help="check what the draft PRs need, as `run --pr` would")
     doc.add_argument("--remote")
     doc.add_argument("--git-name", dest="git_name")
     doc.add_argument("--git-email", dest="git_email")

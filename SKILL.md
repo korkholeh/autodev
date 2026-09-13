@@ -62,7 +62,8 @@ This is the last human input of the run. Everything unasked becomes a logged gue
   together with `--pr` when the run will use it, so the base branch is checked too).
   If the user didn't pass it and the doctor lists several gh accounts while the repo has a GitHub remote,
   ask which account to use (or "local only"). A `FAIL` on push permission or a missing token must be fixed now
-  (`gh auth login` for that account). Useful extras: `--pr` (draft PR with live PROGRESS.md), `--push end|never`,
+  (`gh auth login` for that account). Useful extras: `--pr` (a draft PR per phase, stacked, each based on the one below it, plus one for the
+  whole run carrying the live PROGRESS.md — `--pr single` opens only the latter), `--push end|never`,
   `--gh-repo owner/name` when there is no GitHub remote, `--git-email` to override the noreply address.
 
 ## 2. Launch
@@ -86,7 +87,7 @@ Print the command for the user to run in their own terminal instead:
 - Watch: `tmux attach -t autodev-<repo>` (detach: Ctrl-b d) · `tail -f .autodev/autodev.log`
 - Status: `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py status`
 - Morning, in this order: `.autodev/HANDOFF.md`, `.autodev/PROGRESS.md`, `.autodev/DECISIONS.md`,
-  `docs/user/`, `git log --oneline` on the `autodev/…` branch (or the draft PR, if `--pr`)
+  `docs/user/`, `git log --oneline` on the `autodev/…` branch (or, with `--pr`, the stack of draft PRs — one per phase)
 - Stop gracefully after the current session: `touch .autodev/STOP` · Resume later: same `run` command
 - On macOS: keep the Mac on power with the lid open (caffeinate is on automatically)
 

@@ -1469,6 +1469,119 @@ class PushIsolation(TempCwd):
         self.assertIn("autodev/x", branches)
 
 
+class StackedPullRequests(TempCwd):
+    """One draft PR per finished phase, each based on the phase below it."""
+
+    def orch(self, phases, pr="stacked", branch="autodev/spec-1", base="main"):
+        cfg = {**autodev.DEFAULTS, "pr": pr}
+        st = autodev.new_state("spec.md", cfg)
+        st.update(branch=branch, base_branch=base, phases=phases, pr_url="https://x/pull/9")
+        o = autodev.Orchestrator(st)
+        o.pushed, o.prs = [], []
+        gh = o.github = autodev.GitHub("me")
+        gh.repo, gh.login, gh.token = "owner/repo", "me", "t"
+        gh.push = lambda branch, src="HEAD": o.pushed.append((branch, src))
+
+        def sync_pr(head, base_, title, body):
+            o.prs.append({"head": head, "base": base_, "title": title, "body": body})
+            return f"https://x/pull/{len(o.prs)}"
+        gh.sync_pr = sync_pr
+        Path(".autodev").mkdir(exist_ok=True)
+        return o
+
+    @staticmethod
+    def phase(n, status="done", commit="sha%d", **kw):
+        return {"title": f"Phase {n}", "slug": f"p{n}", "goal": f"goal {n}", "status": status,
+                "commit": (commit % n) if "%" in (commit or "") else commit,
+                "deliverables": ["d"], "acceptance_criteria": ["a"], **kw}
+
+    def test_each_phase_is_based_on_the_one_below_it(self):
+        o = self.orch([self.phase(1), self.phase(2), self.phase(3)])
+        o.publish_stack()
+        self.assertEqual(o.pushed, [("autodev/spec-1-p01-p1", "sha1"),
+                                    ("autodev/spec-1-p02-p2", "sha2"),
+                                    ("autodev/spec-1-p03-p3", "sha3")])
+        self.assertEqual([(pr["head"], pr["base"]) for pr in o.prs],
+                         [("autodev/spec-1-p01-p1", "main"),
+                          ("autodev/spec-1-p02-p2", "autodev/spec-1-p01-p1"),
+                          ("autodev/spec-1-p03-p3", "autodev/spec-1-p02-p2")])
+
+    def test_a_phase_is_published_once_and_then_left_alone(self):
+        phases = [self.phase(1), self.phase(2)]
+        o = self.orch(phases)
+        o.publish_stack()
+        o.pushed.clear(), o.prs.clear()
+        o.publish_stack()                       # the next phase finishing re-enters publish()
+        self.assertEqual(o.pushed, [])
+        self.assertEqual(o.prs, [])
+
+    def test_a_later_phase_still_stacks_on_what_was_published_before(self):
+        phases = [self.phase(1), self.phase(2, status="pending", commit=None)]
+        o = self.orch(phases)
+        o.publish_stack()
+        phases[1].update(status="done", commit="sha2")
+        o.publish_stack()
+        self.assertEqual(o.prs[-1]["base"], "autodev/spec-1-p01-p1")
+
+    def test_a_phase_that_changed_nothing_does_not_break_the_chain(self):
+        """`commit` is None when a phase had nothing to commit — there is no PR to open for it,
+        so the phase after it stacks on the last one that does exist."""
+        o = self.orch([self.phase(1), self.phase(2, commit=None), self.phase(3)])
+        o.publish_stack()
+        self.assertEqual([pr["head"] for pr in o.prs],
+                         ["autodev/spec-1-p01-p1", "autodev/spec-1-p03-p3"])
+        self.assertEqual(o.prs[-1]["base"], "autodev/spec-1-p01-p1")
+
+    def test_an_unfinished_phase_is_not_published(self):
+        o = self.orch([self.phase(1), self.phase(2, status="in_progress")])
+        o.publish_stack()
+        self.assertEqual([pr["head"] for pr in o.prs], ["autodev/spec-1-p01-p1"])
+
+    def test_the_body_carries_the_phase_and_links_back_to_the_run(self):
+        o = self.orch([self.phase(1, warnings=["1 task left unchecked"])])
+        o.publish_stack()
+        body = o.prs[0]["body"]
+        self.assertIn("**Phase 1 of 1**", body)
+        self.assertIn("goal 1", body)
+        self.assertIn("1 task left unchecked", body)
+        self.assertIn("https://x/pull/9", body)          # the umbrella
+
+    def test_the_review_verdict_reaches_the_body(self):
+        o = self.orch([self.phase(1)])
+        d = o.phase_dir(0)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "REVIEW-r1.md").write_text("# Review\n\n**Verdict:** changes_requested\n")
+        (d / "REVIEW-r2.md").write_text("# Review\n\n**Verdict:** approved\n")
+        o.publish_stack()
+        self.assertIn("2 round(s), last verdict: **approved**", o.prs[0]["body"])
+
+    def test_the_umbrella_lists_the_whole_chain(self):
+        o = self.orch([self.phase(1), self.phase(2)])
+        o.publish_stack()
+        m = o.stack_map()
+        self.assertIn("1. https://x/pull/1 — Phase 1", m)
+        self.assertIn("2. https://x/pull/2 — Phase 2", m)
+
+    def test_nothing_published_means_no_stack_section(self):
+        self.assertEqual(self.orch([self.phase(1, status="pending", commit=None)]).stack_map(), "")
+
+    def test_single_keeps_the_old_one_pull_request_behaviour(self):
+        self.assertEqual(self.orch([self.phase(1)], pr="single").pr_mode(), "single")
+
+    def test_a_state_written_before_stacking_existed_gets_the_new_default(self):
+        """`--pr` used to be a boolean; a resumed run should mean what `--pr` means now."""
+        self.assertEqual(self.orch([self.phase(1)], pr=True).pr_mode(), "stacked")
+
+    def test_no_pr_at_all_is_still_off(self):
+        self.assertEqual(self.orch([self.phase(1)], pr="").pr_mode(), "")
+
+    def test_the_phase_branch_never_nests_under_the_run_branch(self):
+        """refs/heads/autodev/spec-1 and refs/heads/autodev/spec-1/p01 cannot both exist."""
+        o = self.orch([self.phase(1)])
+        self.assertFalse(o.phase_branch(0).startswith(o.state["branch"] + "/"))
+        self.assertTrue(o.phase_branch(0).startswith(o.state["branch"] + "-"))
+
+
 class PullRequestBase(TempCwd):
     """The draft PR needs its base branch on the remote, or every push step fails the same way."""
 

@@ -109,7 +109,7 @@ from then on every session reads that file.
 | `--max-hours H`, `--max-sessions N` | ceiling on one run — it stops and tells you how to continue (no ceiling by default) |
 | `--gh-user LOGIN` | token via `gh auth token --user LOGIN`; the active gh account is **not switched** |
 | `--push phase\|end\|never` | when to push the `autodev/…` branch (with `--gh-user`, after every phase by default) |
-| `--pr` | draft PR into the base branch, body = the current `PROGRESS.md` (handy to watch from a phone); the base branch is pushed first if the remote does not have it yet |
+| `--pr` | a draft PR per phase, stacked, plus one for the whole run (`--pr single` for only the run's). See [Stacked pull requests](#stacked-pull-requests) |
 | `--gh-repo owner/name` | repo, if the remote is not GitHub or there is none (`--remote` — a different remote name) |
 | `--git-name`, `--git-email` | override the author; by default the name from the profile + `ID+login@users.noreply.github.com` |
 | `--gh-host` | GitHub Enterprise (then `--git-email` is required) |
@@ -133,6 +133,34 @@ there is nothing such a hook could usefully add. If there is no token for the ac
 or it belongs to a different login, the run fails immediately, before the first commit. If there is no push
 permission, commits stay local and push/PR are disabled with a warning. A push failure does not stop the run —
 the next attempt happens after the next phase.
+
+### Stacked pull requests
+
+A night's work in one pull request is not reviewable, so `--pr` opens one per phase instead — each based on the
+phase below it, the way a stacked-diff workflow does by hand:
+
+```
+main
+ ← #1  autodev 01/07: Skeleton & terminal loop     1 commit
+    ← #2  autodev 02/07: Config & preflight        1 commit
+       ← #3  autodev 03/07: Map rendering          1 commit
+
+main
+ ← #4  autodev: mosslight            the whole run, body = PROGRESS.md
+```
+
+Nothing is rebased and no branch is created locally. The run's history is already linear — one commit per phase —
+so a phase branch is just that phase's commit pushed under its own name, once, when the phase finishes. Its body
+is written from what the phase left behind: goal, deliverables, acceptance criteria, the last review verdict, and
+the phase's warnings. It never needs rewriting afterwards, because the commit cannot change.
+
+The run's own pull request stays as the umbrella: it carries the live `PROGRESS.md` and the map of the chain, and
+it is the one to merge if the whole night is taken as a unit. Otherwise the phases merge bottom-up — GitHub
+retargets the rest of the stack onto the base as each one lands.
+
+Read them in order and stop wherever the work stops being worth reading. A phase that changed nothing gets no
+pull request, and the phase after it stacks on the last one that exists. `--pr single` opens only the run's own
+pull request, as earlier versions did.
 
 ## Control
 
