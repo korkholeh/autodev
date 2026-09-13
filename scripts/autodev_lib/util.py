@@ -98,11 +98,14 @@ def render(name: str, **kw) -> str:
 
 
 def child_env() -> dict:
-    """Environment for child processes: drop markers of an enclosing Claude Code session,
-    otherwise nested `claude` may refuse to start when launched from inside Claude Code."""
+    """Environment for the processes the orchestrator starts.
+
+    Two things go: the markers of an enclosing Claude Code session, otherwise a nested `claude`
+    may refuse to start; and every AUTODEV_* variable, so neither a session nor a test command
+    inherits the orchestrator's own credentials — AUTODEV_OAUTH_TOKEN above all."""
     env = dict(os.environ)
     for k in list(env):
-        if k == "CLAUDECODE" or k == "CLAUDE_CODE_ENTRYPOINT":
+        if k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT") or k.startswith("AUTODEV_"):
             env.pop(k)
     return env
 
@@ -115,6 +118,19 @@ def claude_version(binary: str):
         return None
     m = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
     return tuple(int(x) for x in m.groups()) if m else None
+
+
+def claude_flags(binary: str) -> set:
+    """The long options this build of Claude Code accepts, read once from --help.
+
+    Used to fence a session in only with options it actually has, rather than guessing from the
+    version number and failing the first session of the night."""
+    try:
+        out = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=60,
+                             env=child_env()).stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(re.findall(r"--[a-z][a-z0-9-]+", out))
 
 
 def extract_json(result_ev: dict | None, required_key: str):

@@ -95,6 +95,11 @@ from then on every session reads that file.
 | `--e2e auto\|off` | end-to-end QA on user-facing phases (`auto` by default) |
 | `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`, `--e2e-ready-url` | e2e suite and service lifecycle (the up command must be idempotent and must return) |
 | `--allow-cmd BINARY` | also accept commands starting with `BINARY` when a session proposes one (repeatable) |
+| `--web on\|off` | let the sessions use WebFetch/WebSearch (`off` by default) |
+| `--mcp-config FILE` | MCP servers for the sessions, a file or a JSON string (repeatable) |
+| `--inherit-mcp` | also give the sessions the MCP servers configured for you |
+| `--allow-no-verify` | commit past a failing git hook instead of stopping |
+| `--adopt` | resume run state in `.autodev/` that this machine did not create |
 | `--no-docs`, `--no-finalize` | disable the documentation step / the final session |
 | `--model-plan\|impl\|review\|qa` | models per step (opus / sonnet / opus / sonnet) |
 | `--max-test-fix`, `--max-e2e-fix`, `--max-review-rounds`, `--max-impl-runs` | loop limits |
@@ -124,7 +129,7 @@ the next attempt happens after the next phase.
 
 ## Control
 
-- status: `autodev.py status` · log: `tail -f .autodev/autodev.log`
+- status: `autodev.py status` · log: `tail -f .autodev/autodev.log` · e2e services: `.autodev/logs/e2e-surfaces.log`
 - stop after the current session: `touch .autodev/STOP` · immediately: Ctrl-C (the session will be resumed on the next `run`)
 - continue: the same `run` · start over: `run --fresh`
 
@@ -156,10 +161,26 @@ anything, so the branch would be committed, reviewed and documented unverified. 
 both end without a usable test command, the run fails there — minutes after launch — and tells you to pass
 `--test-cmd`. Resume with the same `run` command once you have.
 
-By default `--permission-mode auto` (a classifier checks the actions) + `--permission-prompts none`.
-`--permission-mode bypass` — only inside Docker/a VM. User hooks from `~/.claude` also run in the sessions —
-check that they do not block large changes (e.g. PR size limits). Never run e2e against production:
-`--e2e-up-cmd` must bring up local services with test data.
+**What a session can reach.** Sessions run with `--permission-mode auto` (a classifier checks each action) and
+`--permission-prompts none`. On top of that, a session gets no `AUTODEV_*` variable from the environment (the
+usage token above all), no MCP server beyond the ones you name with `--mcp-config`, and no web access: `WebFetch`
+and `WebSearch` are blocked unless you pass `--web on`. Web access is the one channel that reaches outside the
+repository, which is why an unattended run does without it by default — turn it on when the work needs to look
+something up. `--inherit-mcp` hands the sessions your own MCP servers instead. Hooks from `~/.claude` still run
+in the sessions: check that they do not block large changes (e.g. PR size limits). `--permission-mode bypass` —
+only inside Docker or a VM. Never run e2e against production: `--e2e-up-cmd` must bring up local services with
+test data.
+
+**Commit hooks are not bypassed.** A pre-commit hook is this repository's own check — usually the secret scanner
+or the lint gate — so a hook that rejects a commit stops the run instead of being worked around. The one case
+handled automatically is a hook that reformats files and then fails: what it wrote is restaged and committed once.
+`--allow-no-verify` restores the old behaviour for a repository whose hooks are known to be broken, and every
+bypass is recorded in `DECISIONS.md`.
+
+**A run belongs to the machine that started it.** `.autodev/state.json` names the commands the orchestrator runs
+and the branch it pushes, and a repository can carry a `.autodev/` of its own. Each run is claimed by a marker
+kept outside the repository (`~/.autodev/runs/`, or `AUTODEV_HOME`), and state that did not start here is refused:
+start over with `--fresh`, or read `.autodev/state.json` and accept it deliberately with `--adopt`.
 
 ## What to edit in the skill itself
 

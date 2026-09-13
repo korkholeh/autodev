@@ -19,7 +19,9 @@ Run `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py doctor --spec <spec-file>` a
 
 - **FAIL** lines must be fixed before launch (missing spec, git identity, Claude Code not found, a missing toolchain
   for the detected stack profile).
-- **Existing run** in `.autodev/`: ask whether to resume (default) or start over (`--fresh`).
+- **Existing run** in `.autodev/`: ask whether to resume (default) or start over (`--fresh`). If the doctor says
+  the state was not started on this machine, it arrived with the repository — read `.autodev/state.json` with the
+  user before offering `--adopt`, since it names the commands the orchestrator will run.
 - **Usage API unavailable**: tell the user pauses will only trigger on limit events/errors; suggest `AUTODEV_OAUTH_TOKEN`.
 - **Stack profile.** The doctor prints the detected one (`swift-macos`, `swift-ios`, `rust-tui`, `django-htmx`,
   `django-react`, `fastapi-react`, `generic`). For an empty repository, detection will say `generic` — confirm what is
@@ -49,6 +51,10 @@ This is the last human input of the run. Everything unasked becomes a logged gue
 - **A run with no test command stops at the architect step**, because otherwise every phase would report a passing
   suite without running anything. If the doctor could not guess a test command, agreeing on one here is worth a
   question.
+- **Sessions have no web access and no MCP servers** unless asked for: `--web on` when the work needs to look
+  things up (an unfamiliar API, a current version), `--mcp-config <file>` for a server this project needs.
+- **A failing commit hook stops the run.** If the repository has hooks the user knows are broken, `--allow-no-verify`
+  is the escape; otherwise fixing them before launch is the better answer.
 - Never point the e2e commands at production or at real user data.
 - **GitHub identity.** Commits/pushes use the account from `--gh-user <login>` (pass the same flag to `doctor`).
   If the user didn't pass it and the doctor lists several gh accounts while the repo has a GitHub remote,

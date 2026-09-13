@@ -19,8 +19,10 @@ Stdlib only, Python 3.9+.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import secrets
 import re
 import shutil
 import signal
@@ -42,9 +44,9 @@ from autodev_lib.github import GitHub  # noqa: E402
 from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
 from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
                               STOP_FILE, SURFACE_LOG, StepFailed, StopRequested, atomic_write,
-                              available_profiles, bullets, child_env, claude_version, detect_profile,
-                              extract_json, git, hm, log, one_line, render, set_log_path, slugify,
-                              ts, unchecked_tasks)
+                              available_profiles, bullets, child_env, claude_flags, claude_version,
+                              detect_profile, extract_json, git, hm, log, one_line, render,
+                              set_log_path, slugify, ts, unchecked_tasks)
 
 PERMISSION_PROMPTS_MIN = (2, 1, 259)  # first version with --permission-prompts none
 BLOCKING = {"blocker", "major"}
@@ -80,7 +82,11 @@ DEFAULTS = {
     "branch": True,
     "caffeinate": True,
     "claude_bin": "claude",
-    "allow_cmd": [],     # extra head binaries a session may propose in a command
+    "allow_cmd": [],        # extra head binaries a session may propose in a command
+    "web": "off",           # on = sessions may use WebFetch/WebSearch
+    "mcp_config": [],       # MCP server definitions to give the sessions (files or JSON strings)
+    "inherit_mcp": False,   # True = let the sessions see the user's own MCP servers too
+    "allow_no_verify": False,   # True = commit past a failing git hook instead of stopping
     # git / GitHub
     "gh_user": "",        # gh account login to commit & push as
     "gh_host": "github.com",
@@ -188,6 +194,45 @@ NUDGE = ("Autonomous mode: no human is available. If you asked a question or off
          "step to completion. Then return the required structured output.")
 
 
+# ------------------------------------------------------------------- whose run is this anyway
+# The state file names the commands the orchestrator runs and the branch it pushes. A repository
+# can carry a `.autodev/` of its own, so a run is claimed by a marker kept outside the repository,
+# where nothing that arrives with a clone can write it.
+def run_marker() -> Path:
+    home = Path(os.environ.get("AUTODEV_HOME") or Path.home() / ".autodev")
+    key = hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:16]
+    return home / "runs" / f"{key}.json"
+
+
+def claim_run(run_id: str) -> None:
+    """Record on this machine that the run in this directory is ours."""
+    atomic_write(run_marker(), json.dumps(
+        {"run_id": run_id, "path": str(Path.cwd().resolve()), "claimed": ts()}, indent=2))
+
+
+def owns_run(run_id: str) -> bool:
+    try:
+        return bool(run_id) and json.loads(run_marker().read_text()).get("run_id") == run_id
+    except (OSError, ValueError):
+        return False
+
+
+def ensure_run_is_ours(state: dict, adopt: bool) -> None:
+    """Refuse to resume a run this machine did not start, unless told to adopt it."""
+    if owns_run(state.get("run_id") or ""):
+        return
+    if adopt:
+        claim_run(state.setdefault("run_id", secrets.token_hex(16)))
+        log("adopted the run state already in .autodev/ (--adopt)")
+        return
+    raise StepFailed(
+        "the run state in .autodev/ was not started on this machine — it may have arrived with the "
+        "repository. It names the commands the orchestrator runs and the branch it pushes, so it is "
+        "not resumed on trust.\n"
+        "  start over:            run --spec <spec> --fresh\n"
+        "  adopt it deliberately: run --adopt (after reading .autodev/state.json)")
+
+
 # ----------------------------------------------------------------------------- orchestrator
 PHASE_STEPS = {         # phase step -> the Orchestrator method that runs it and names the next step
     "plan": "_plan", "implement": "_implement", "test": "_test", "test_fix": "_test_fix",
@@ -228,6 +273,7 @@ class Orchestrator:
         self.surface_proc: subprocess.Popen | None = None
         self.stop_flag = False
         self.supports_prompts_none = False
+        self.claude_flags: set = set()
         self.autonomy = ""
         self.github: GitHub | None = None
         self.push_mode = "never"
@@ -331,10 +377,8 @@ class Orchestrator:
         (AD / "logs").mkdir(parents=True, exist_ok=True)
         set_log_path(AD / "autodev.log")
 
-        gi = AD / ".gitignore"
-        if not gi.exists():
-            gi.write_text("logs/\nguides/\nstate.json\nstate.json.tmp\nrun.pid\nSTOP\n"
-                          "autodev.log\nconsole.log\n")
+        (AD / ".gitignore").write_text("logs/\nguides/\nstate.json\nstate.json.tmp\nrun.pid\nSTOP\n"
+                                       "autodev.log\nconsole.log\n")
         self.install_guides()
         dec = AD / "DECISIONS.md"
         if not dec.exists():
@@ -353,6 +397,11 @@ class Orchestrator:
         if ver is None:
             raise StepFailed(f"`{self.cfg['claude_bin']} --version` failed — is Claude Code installed?")
         self.supports_prompts_none = ver >= PERMISSION_PROMPTS_MIN
+        self.claude_flags = claude_flags(self.cfg["claude_bin"])
+        log("sessions: "
+            + ("user MCP servers inherited" if self.cfg.get("inherit_mcp") else "no inherited MCP servers")
+            + (", web on" if self.cfg.get("web") == "on" else ", no web access")
+            + ", AUTODEV_* stripped from the environment")
         if not self.supports_prompts_none:
             log(f"WARN Claude Code {'.'.join(map(str, ver))} < 2.1.259: no --permission-prompts none; "
                 "relying on --disallowedTools AskUserQuestion + prompt rules")
@@ -463,19 +512,35 @@ class Orchestrator:
         proc.kill()
         proc.wait()
 
-    def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=()):
-        cfg, st = self.cfg, self.state
-        st["session_counter"] = st.get("session_counter", 0) + 1
-        base = AD / "logs" / f"{st['session_counter']:03d}-{label}"
+    def session_command(self, prompt, model, schema, resume=None, extra_disallowed=()) -> list:
+        """The argv for one headless session, including everything that fences it in.
+
+        A session reads the spec, the repository and whatever those point at, so the fence matters:
+        no question it could wait forever on, no MCP server the developer did not name, and by
+        default no web access — that is the one channel that reaches outside the repository."""
+        cfg = self.cfg
         cmd = [cfg["claude_bin"], "-p", prompt, "--output-format", "stream-json", "--verbose",
                "--model", model, "--json-schema", json.dumps(schema), "--append-system-prompt", self.autonomy,
                "--permission-mode", "bypassPermissions" if cfg["permission_mode"] == "bypass" else "auto"]
         if self.supports_prompts_none:
             cmd += ["--permission-prompts", "none"]
-        cmd += ["--disallowedTools", ",".join(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-                                               *extra_disallowed])]
+        blocked = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode", *extra_disallowed]
+        if cfg.get("web") != "on":
+            blocked += ["WebFetch", "WebSearch"]
+        cmd += ["--disallowedTools", ",".join(blocked)]
+        if not cfg.get("inherit_mcp") and "--strict-mcp-config" in self.claude_flags:
+            cmd += ["--strict-mcp-config"]
+        for conf in cfg.get("mcp_config") or []:
+            cmd += ["--mcp-config", conf]
         if resume:
             cmd += ["--resume", resume]
+        return cmd
+
+    def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=()):
+        cfg, st = self.cfg, self.state
+        st["session_counter"] = st.get("session_counter", 0) + 1
+        base = AD / "logs" / f"{st['session_counter']:03d}-{label}"
+        cmd = self.session_command(prompt, model, schema, resume, extra_disallowed)
 
         out = {"session_id": resume, "result": None, "interrupted": None, "rejected": False, "exit": None}
         started = time.time()
@@ -791,14 +856,37 @@ class Orchestrator:
         return self._shell(cmd, self.cfg["e2e_timeout"], pdir / "E2E_OUTPUT.txt", "e2e suite")
 
     def commit(self, message: str, body: str) -> str | None:
+        """Commit the work. A failing commit hook stops the run rather than being bypassed.
+
+        The hooks are the repository's own checks — often the secret scanner or the lint gate —
+        and a night of commits pushed past them is exactly what nobody reviews in the morning. The
+        one thing handled automatically is the common case of a hook that reformats files and then
+        fails: that is restaged and committed once."""
+        def attempt():
+            return subprocess.run(["git", "commit", "-q", "-m", message, "-m", body],
+                                  capture_output=True, text=True)
+
         git("add", "-A")
         if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
             return None
-        r = subprocess.run(["git", "commit", "-q", "-m", message, "-m", body], capture_output=True, text=True)
+        before = git("status", "--porcelain", check=False)
+        r = attempt()
+        if r.returncode != 0 and git("status", "--porcelain", check=False) != before:
+            log("WARN a commit hook changed files and failed — restaging what it did and retrying once")
+            git("add", "-A")
+            r = attempt()
         if r.returncode != 0:
-            log(f"WARN git commit failed (hooks?): {one_line(r.stderr or r.stdout, 300)} — retrying --no-verify")
-            git("commit", "-q", "--no-verify", "-m", message, "-m", body + "\n\n[autodev] commit hooks failed; "
-                "committed with --no-verify")
+            detail = one_line(r.stderr or r.stdout, 400)
+            if not self.cfg.get("allow_no_verify"):
+                raise StepFailed(
+                    f"a git commit hook rejected this commit: {detail}\nThose hooks are this "
+                    "repository's own checks, so autodev does not commit past them. Fix the cause and "
+                    "run again to resume, or pass --allow-no-verify if they are known to be broken.")
+            log(f"WARN committing past the hooks, as --allow-no-verify asked: {detail}")
+            self.record_decision(f"commit hooks failed ({detail}); committed with --no-verify because "
+                                 "--allow-no-verify was set")
+            git("commit", "-q", "--no-verify", "-m", message,
+                "-m", body + "\n\n[autodev] commit hooks failed; committed with --no-verify")
         return git("rev-parse", "--short", "HEAD")
 
     def publish(self, final: bool = False) -> None:
@@ -1253,6 +1341,7 @@ class Orchestrator:
 # ----------------------------------------------------------------------------- CLI
 def new_state(spec: str, cfg: dict) -> dict:
     return {"version": 1, "spec": spec, "created": ts(), "status": "running", "branch": None, "config": cfg,
+            "run_id": secrets.token_hex(16),
             "project": {}, "phases": [], "phase_index": 0, "step": "architect", "phase_ctx": {}, "events": [],
             "session_counter": 0, "active_session": None, "totals": {"sessions": 0, "seconds": 0, "cost_usd": 0.0}}
 
@@ -1273,6 +1362,10 @@ def cmd_run(args) -> int:
         print(f"moved previous run to {bak}")
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        try:
+            ensure_run_is_ours(state, args.adopt)
+        except StepFailed as e:
+            sys.exit(str(e))
         state["config"] = {**DEFAULTS, **state["config"], **cli_overrides(args)}
         print(f"resuming run: status={state['status']} step={state['step']}")
     else:
@@ -1280,6 +1373,7 @@ def cmd_run(args) -> int:
             sys.exit("--spec must point to an existing file for a new run")
         AD.mkdir(exist_ok=True)
         state = new_state(Path(args.spec).as_posix(), {**DEFAULTS, **cli_overrides(args)})
+        claim_run(state["run_id"])
     return Orchestrator(state).run()
 
 
@@ -1387,10 +1481,16 @@ def cmd_doctor(args) -> int:
             + ("found" if shutil.which("xcodebuild") else "not found — install Xcode command line tools"))
     if prof == "rust-tui":
         rep("OK" if shutil.which("cargo") else "FAIL", "cargo " + ("found" if shutil.which("cargo") else "not found"))
+    if Path(".autodev").exists() and git("ls-files", ".autodev", check=False):
+        rep("WARN", ".autodev/ is committed to this repository — it names the commands the orchestrator "
+                    "runs; state that did not start here is refused unless you pass --adopt")
     if STATE_FILE.exists():
         st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         rep("INFO", f"existing run: status={st['status']} step={st['step']} phase_index={st['phase_index']} "
                     "(run resumes it; --fresh starts over)")
+        rep("OK" if owns_run(st.get("run_id") or "") else "WARN",
+            "run state started on this machine" if owns_run(st.get("run_id") or "") else
+            "run state was not started on this machine — `run` refuses it without --adopt")
     return 1 if fails else 0
 
 
@@ -1432,6 +1532,16 @@ def main() -> int:
     run.add_argument("--no-branch", dest="branch", action="store_const", const=False)
     run.add_argument("--no-caffeinate", dest="caffeinate", action="store_const", const=False)
     run.add_argument("--claude-bin", dest="claude_bin")
+    run.add_argument("--adopt", action="store_true",
+                     help="resume run state in .autodev/ that this machine did not create")
+    run.add_argument("--web", choices=["on", "off"],
+                     help="let sessions use WebFetch/WebSearch (default off)")
+    run.add_argument("--mcp-config", dest="mcp_config", action="append", metavar="FILE",
+                     help="MCP servers for the sessions, a file or a JSON string (repeatable)")
+    run.add_argument("--inherit-mcp", dest="inherit_mcp", action="store_const", const=True,
+                     help="also give the sessions the MCP servers configured for you")
+    run.add_argument("--allow-no-verify", dest="allow_no_verify", action="store_const", const=True,
+                     help="commit past a failing git hook instead of stopping")
     run.add_argument("--allow-cmd", dest="allow_cmd", action="append", metavar="BINARY",
                      help="also accept commands starting with BINARY when a session proposes one "
                           "(repeatable); commands you pass yourself are never checked")

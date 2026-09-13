@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -590,6 +591,160 @@ class ShippedProfileCommands(unittest.TestCase):
                         continue
                     ok, why = commands.command_allowed(cmd)
                     self.assertTrue(ok, f"{path.name}: `{cmd}` would be refused ({why})")
+
+
+class SessionFence(TempCwd):
+    """What a headless session is and is not allowed to reach."""
+
+    def orch(self, **cfg):
+        conf = dict(autodev.DEFAULTS)
+        conf.update(cfg)
+        o = autodev.Orchestrator(autodev.new_state("spec.md", conf))
+        o.claude_flags = {"--strict-mcp-config", "--permission-prompts"}
+        o.autonomy = "rules"
+        return o
+
+    def argv(self, **cfg):
+        return self.orch(**cfg).session_command("go", "opus", {"type": "object"})
+
+    def test_the_orchestrators_own_credentials_do_not_reach_a_child(self):
+        os.environ["AUTODEV_OAUTH_TOKEN"] = "secret"
+        os.environ["AUTODEV_KEYCHAIN_SERVICE"] = "x"
+        self.addCleanup(os.environ.pop, "AUTODEV_OAUTH_TOKEN", None)
+        self.addCleanup(os.environ.pop, "AUTODEV_KEYCHAIN_SERVICE", None)
+        env = util.child_env()
+        self.assertFalse([k for k in env if k.startswith("AUTODEV_")])
+        self.assertNotIn("CLAUDECODE", env)
+
+    def test_the_usage_guard_still_reads_its_own_token(self):
+        os.environ["AUTODEV_OAUTH_TOKEN"] = "secret"
+        self.addCleanup(os.environ.pop, "AUTODEV_OAUTH_TOKEN", None)
+        self.assertEqual(usage.UsageGuard.token(), "secret")
+
+    def test_a_session_cannot_ask_a_question_or_reach_the_web(self):
+        blocked = self.argv()[self.argv().index("--disallowedTools") + 1].split(",")
+        for tool in ("AskUserQuestion", "ExitPlanMode", "WebFetch", "WebSearch"):
+            self.assertIn(tool, blocked)
+
+    def test_web_access_can_be_turned_back_on(self):
+        argv = self.argv(web="on")
+        blocked = argv[argv.index("--disallowedTools") + 1].split(",")
+        self.assertNotIn("WebFetch", blocked)
+        self.assertIn("AskUserQuestion", blocked)
+
+    def test_no_mcp_server_is_inherited_by_default(self):
+        self.assertIn("--strict-mcp-config", self.argv())
+
+    def test_named_mcp_servers_are_passed_through(self):
+        argv = self.argv(mcp_config=["servers.json"])
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(argv[argv.index("--mcp-config") + 1], "servers.json")
+
+    def test_inheriting_the_users_mcp_servers_is_opt_in(self):
+        self.assertNotIn("--strict-mcp-config", self.argv(inherit_mcp=True))
+
+    def test_an_option_this_build_lacks_is_not_passed(self):
+        o = self.orch()
+        o.claude_flags = set()
+        self.assertNotIn("--strict-mcp-config", o.session_command("go", "opus", {}))
+
+    def test_a_resumed_session_keeps_the_same_fence(self):
+        argv = self.orch().session_command("go", "opus", {}, resume="sid-1")
+        self.assertEqual(argv[argv.index("--resume") + 1], "sid-1")
+        self.assertIn("--strict-mcp-config", argv)
+
+
+class RunOwnership(TempCwd):
+    """Run state that arrived with a repository is not resumed on trust."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["AUTODEV_HOME"] = str(Path.cwd() / "home")
+        self.addCleanup(os.environ.pop, "AUTODEV_HOME", None)
+
+    def test_a_new_run_carries_an_id(self):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        self.assertTrue(state["run_id"])
+        self.assertNotEqual(state["run_id"], autodev.new_state("spec.md", {})["run_id"])
+
+    def test_a_claimed_run_is_recognised_again(self):
+        autodev.claim_run("abc")
+        self.assertTrue(autodev.owns_run("abc"))
+        self.assertFalse(autodev.owns_run("other"))
+        self.assertFalse(autodev.owns_run(""))
+
+    def test_state_from_elsewhere_is_refused(self):
+        with self.assertRaises(util.StepFailed) as e:
+            autodev.ensure_run_is_ours({"run_id": "planted"}, adopt=False)
+        self.assertIn("--fresh", str(e.exception))
+        self.assertIn("--adopt", str(e.exception))
+
+    def test_state_with_no_id_at_all_is_refused(self):
+        with self.assertRaises(util.StepFailed):
+            autodev.ensure_run_is_ours({}, adopt=False)
+
+    def test_our_own_state_resumes_without_a_word(self):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        autodev.claim_run(state["run_id"])
+        autodev.ensure_run_is_ours(state, adopt=False)
+
+    def test_adopting_claims_the_run_for_this_machine(self):
+        state = {"run_id": "planted"}
+        autodev.ensure_run_is_ours(state, adopt=True)
+        self.assertTrue(autodev.owns_run("planted"))
+        autodev.ensure_run_is_ours(state, adopt=False)
+
+    def test_the_marker_lives_outside_the_repository(self):
+        autodev.claim_run("abc")
+        self.assertNotIn(".autodev/", autodev.run_marker().as_posix().replace(str(Path.cwd()), ""))
+        self.assertTrue(autodev.run_marker().is_file())
+
+
+class CommitHooks(TempCwd):
+    """A repository's own commit hooks are checks, not obstacles to route around."""
+
+    def repo(self, **cfg):
+        for args in (["init", "-q", "."], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "T"]):
+            subprocess.run(["git", *args], check=True, capture_output=True)
+        Path("file.txt").write_text("one\n")
+        Path(".autodev").mkdir(exist_ok=True)
+        conf = dict(autodev.DEFAULTS)
+        conf.update(cfg)
+        return autodev.Orchestrator(autodev.new_state("spec.md", conf))
+
+    def hook(self, script):
+        path = Path(".git/hooks/pre-commit")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n" + script)
+        path.chmod(0o755)
+
+    def test_a_rejected_commit_stops_the_run(self):
+        o = self.repo()
+        self.hook("echo 'secret found in file.txt' >&2\nexit 1\n")
+        with self.assertRaises(util.StepFailed) as e:
+            o.commit("autodev: phase 01", "body")
+        self.assertIn("secret found", str(e.exception))
+        self.assertIn("--allow-no-verify", str(e.exception))
+
+    def test_a_hook_that_reformats_and_fails_is_retried_once(self):
+        o = self.repo()
+        self.hook("if [ -f .formatted ]; then exit 0; fi\ntouch .formatted\n"
+                  "echo formatted >> file.txt\nexit 1\n")
+        self.assertTrue(o.commit("autodev: phase 01", "body"))
+        self.assertIn("formatted", Path("file.txt").read_text())
+
+    def test_bypassing_the_hooks_is_explicit_and_recorded(self):
+        o = self.repo(allow_no_verify=True)
+        self.hook("exit 1\n")
+        self.assertTrue(o.commit("autodev: phase 01", "body"))
+        self.assertIn("--no-verify", Path(".autodev/DECISIONS.md").read_text())
+
+    def test_a_clean_commit_needs_no_special_handling(self):
+        o = self.repo()
+        sha = o.commit("autodev: phase 01", "body")
+        self.assertTrue(sha)
+        self.assertIsNone(o.commit("autodev: nothing changed", "body"))
 
 
 class SkillLayout(unittest.TestCase):
