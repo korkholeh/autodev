@@ -3,7 +3,7 @@ name: autodev
 description: Launch a fully autonomous development run from a specification file — a technology-agnostic pipeline that designs the architecture, plans phases, then for every phase plans → implements → tests → reviews → drives end-to-end QA → writes documentation → commits, each step in a separate headless Claude session, auto-pausing near the usage limit. Only when the user explicitly runs /autodev.
 argument-hint: <spec-file> [--profile <stack>] [--gh-user <login>] [--pr] [other autodev.py run flags]
 disable-model-invocation: true
-allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py *) Bash(tmux *) Bash(git status *) Bash(git log *) Bash(git init *) Read
+allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py *) Bash(tmux *) Bash(git status *) Bash(git log *) Bash(git init *) Read Write(.autodev/*) Edit
 ---
 
 # /autodev — launcher

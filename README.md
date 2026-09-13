@@ -137,7 +137,11 @@ the next attempt happens after the next phase.
 
 - status: `autodev.py status` · log: `tail -f .autodev/autodev.log` · e2e services: `.autodev/logs/e2e-surfaces.log`
 - stop after the current session: `touch .autodev/STOP` · immediately: Ctrl-C (the session will be resumed on the next `run`)
-- continue: the same `run` · start over: `run --fresh`
+- continue: the same `run` · start over: `run --fresh` (the previous `.autodev/` is archived next to it, and
+  `INTAKE.md` — the answers from the pre-flight interview — is carried over into the new run)
+- the spec belongs to the run: a `--spec` that differs from the one being resumed is reported and ignored;
+  `--fresh` is how you change it
+- the run needs a branch to start from, so a detached HEAD stops it before the first session (`doctor` says so too)
 
 ## Usage limits
 

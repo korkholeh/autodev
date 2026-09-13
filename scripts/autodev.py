@@ -206,6 +206,19 @@ def run_marker() -> Path:
     return home / "runs" / f"{key}.json"
 
 
+def current_branch_or_fail() -> str:
+    """The branch the run starts from, refusing a detached HEAD.
+
+    On a detached HEAD `rev-parse --abbrev-ref` answers "HEAD", which would become the run's base
+    branch: nothing to return to, and a pull request opened against it fails hours into the run."""
+    cur = git("rev-parse", "--abbrev-ref", "HEAD")
+    if cur == "HEAD":
+        raise StepFailed("this repository is on a detached HEAD, so the run has no base branch to come back "
+                         "to, and a pull request opened against 'HEAD' would only fail hours from now. "
+                         "Check out a branch first: git switch -c <name>")
+    return cur
+
+
 def claim_run(run_id: str) -> None:
     """Record on this machine that the run in this directory is ours."""
     atomic_write(run_marker(), json.dumps(
@@ -434,7 +447,7 @@ class Orchestrator:
         if subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True).returncode != 0:
             git("commit", "-q", "--allow-empty", "-m", "autodev: initial commit")
         if not st.get("branch"):
-            cur = git("rev-parse", "--abbrev-ref", "HEAD")
+            cur = current_branch_or_fail()
             st["base_branch"] = cur
             if self.cfg.get("branch") and not cur.startswith("autodev/"):
                 cur = f"autodev/{slugify(Path(st['spec']).stem)}-{datetime.now():%Y%m%d-%H%M}"
@@ -1484,6 +1497,11 @@ def cmd_run(args) -> int:
         bak = Path(f".autodev.bak-{datetime.now():%Y%m%d-%H%M%S}")
         AD.rename(bak)
         print(f"moved previous run to {bak}")
+        intake = bak / "INTAKE.md"
+        if intake.exists():      # written by the pre-flight interview, minutes before this command
+            AD.mkdir(exist_ok=True)
+            shutil.copyfile(intake, AD / "INTAKE.md")
+            print("kept INTAKE.md from the pre-flight interview")
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         try:
@@ -1491,6 +1509,9 @@ def cmd_run(args) -> int:
         except StepFailed as e:
             sys.exit(str(e))
         state["config"] = {**DEFAULTS, **state["config"], **cli_overrides(args)}
+        if args.spec and Path(args.spec).as_posix() != state.get("spec"):
+            print(f"WARNING --spec {args.spec} ignored: this run follows {state.get('spec')} "
+                  "(--fresh starts over with a different spec)")
         print(f"resuming run: status={state['status']} step={state['step']}")
     else:
         if not args.spec or not Path(args.spec).is_file():
@@ -1541,6 +1562,16 @@ def cmd_doctor(args) -> int:
             if dirty else "git: clean working tree")
         if not (args.gh_user or args.git_email):
             rep("OK" if git("config", "user.email", check=False) else "FAIL", "git identity (user.email)")
+        if not (args.gh_user or args.git_name):
+            rep("OK" if git("config", "user.name", check=False) else "FAIL", "git identity (user.name)")
+        head = git("rev-parse", "--abbrev-ref", "HEAD", check=False)
+        rep("FAIL" if head == "HEAD" else "OK",
+            "git: detached HEAD — check out a branch first, the run needs a base branch to return to"
+            if head == "HEAD" else f"git: on branch {head or '(unborn)'}")
+        rep("OK" if Path(".gitignore").exists() else "WARN",
+            "root .gitignore" + ("" if Path(".gitignore").exists() else
+                                 " missing — whatever a session installs or generates lands in the index; "
+                                 "the commit filter holds the usual suspects back, but a gitignore is the fix"))
     else:
         rep("WARN", "not a git repo — autodev will run `git init`")
     binary = args.claude_bin or DEFAULTS["claude_bin"]
@@ -1577,6 +1608,10 @@ def cmd_doctor(args) -> int:
     g.refresh(force=True)
     rep("OK" if g.api_ok else "WARN", f"usage API: {g.describe()}" if g.api_ok else
         "usage API unavailable — pauses will trigger only on limit events/errors (set AUTODEV_OAUTH_TOKEN)")
+    if sys.platform == "darwin" and not os.environ.get("AUTODEV_OAUTH_TOKEN"):
+        rep("INFO", "usage token: read from the login Keychain — the first read on a machine can raise a "
+                    "system dialog, which an unattended run cannot answer. Run `doctor` once on the machine "
+                    "that will host the run, or set AUTODEV_OAUTH_TOKEN.")
     rep("OK" if shutil.which("tmux") else "WARN", "tmux " + ("found" if shutil.which("tmux") else "not found"))
     if sys.platform == "darwin":
         rep("OK" if shutil.which("caffeinate") else "WARN", "caffeinate (prevents sleep; keep the lid open/on power)")

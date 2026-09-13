@@ -11,7 +11,10 @@ and how the usage guard reads a limit.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -362,6 +365,72 @@ class ReadOnlySessions(TempCwd):
         autodev.git = lambda *a, **kw: "\n".join(lines)
         self.assertEqual(autodev.Orchestrator.worktree_marks(),
                          {" M app/views.py", "?? notes.md"})
+
+
+class RunEntry(TempCwd):
+    """What `run` does before the orchestrator starts: the archive, the resume, the base branch."""
+
+    def setUp(self):
+        super().setUp()
+        self._orch = autodev.Orchestrator
+        self.started: list = []
+        outer = self
+
+        class Stub:
+            def __init__(self, state):
+                outer.started.append(state)
+
+            def run(self):
+                return 0
+
+        autodev.Orchestrator = Stub
+        self.addCleanup(lambda: setattr(autodev, "Orchestrator", self._orch))
+        os.environ["AUTODEV_HOME"] = str(Path(self._tmp.name) / "home")
+        self.addCleanup(lambda: os.environ.pop("AUTODEV_HOME", None))
+
+    @staticmethod
+    def args(**kw):
+        return argparse.Namespace(**{"spec": None, "fresh": False, "adopt": False, **kw})
+
+    def test_fresh_keeps_the_answers_from_the_pre_flight_interview(self):
+        """Regression: --fresh archived the INTAKE.md the launcher had written minutes earlier."""
+        Path(".autodev").mkdir()
+        Path(".autodev/INTAKE.md").write_text("Q: auth? A: sessions, not JWT\n")
+        Path(".autodev/state.json").write_text(json.dumps({"run_id": "x", "config": {}, "spec": "spec.md"}))
+        Path("spec.md").write_text("# spec\n")
+        autodev.cmd_run(self.args(spec="spec.md", fresh=True))
+        self.assertIn("sessions, not JWT", Path(".autodev/INTAKE.md").read_text())
+        self.assertTrue(any(p.name.startswith(".autodev.bak-") for p in Path(".").iterdir()))
+
+    def test_a_spec_that_differs_from_the_run_is_reported_not_silently_dropped(self):
+        Path(".autodev").mkdir()
+        Path(".autodev/state.json").write_text(json.dumps(
+            {"run_id": "x", "config": {}, "spec": "docs/old.md", "status": "running", "step": "plan"}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            autodev.cmd_run(self.args(spec="docs/new.md", adopt=True))
+        self.assertIn("--spec docs/new.md ignored", out.getvalue())
+        self.assertEqual(self.started[0]["spec"], "docs/old.md")
+
+    def test_the_same_spec_on_a_resume_says_nothing(self):
+        Path(".autodev").mkdir()
+        Path(".autodev/state.json").write_text(json.dumps(
+            {"run_id": "x", "config": {}, "spec": "docs/spec.md", "status": "running", "step": "plan"}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            autodev.cmd_run(self.args(spec="docs/spec.md", adopt=True))
+        self.assertNotIn("ignored", out.getvalue())
+
+    def test_a_detached_head_stops_the_run_before_it_starts(self):
+        autodev.git = lambda *a, **kw: "HEAD"
+        with self.assertRaises(util.StepFailed) as e:
+            autodev.current_branch_or_fail()
+        self.assertIn("detached HEAD", str(e.exception))
+        self.assertIn("git switch", str(e.exception))
+
+    def test_an_ordinary_branch_is_taken_as_the_base(self):
+        autodev.git = lambda *a, **kw: "main"
+        self.assertEqual(autodev.current_branch_or_fail(), "main")
 
 
 class CommandVetting(unittest.TestCase):
