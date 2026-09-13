@@ -41,6 +41,7 @@ AD = Path(".autodev")
 STATE_FILE = AD / "state.json"
 STOP_FILE = AD / "STOP"
 PID_FILE = AD / "run.pid"
+SURFACE_LOG = AD / "logs" / "e2e-surfaces.log"
 USAGE_ENDPOINT = os.environ.get("AUTODEV_USAGE_ENDPOINT", "https://api.anthropic.com/api/oauth/usage")
 RESET_BUFFER_S = int(os.environ.get("AUTODEV_RESET_BUFFER", "120"))
 PERMISSION_PROMPTS_MIN = (2, 1, 259)  # first version with --permission-prompts none
@@ -77,6 +78,7 @@ DEFAULTS = {
     "branch": True,
     "caffeinate": True,
     "claude_bin": "claude",
+    "allow_cmd": [],     # extra head binaries a session may propose in a command
     # git / GitHub
     "gh_user": "",        # gh account login to commit & push as
     "gh_host": "github.com",
@@ -252,6 +254,101 @@ def one_line(s: str, limit=300) -> str:
 
 def bullets(items) -> str:
     return "\n".join(f"- {x}" for x in (items or [])) or "- (none)"
+
+
+# --------------------------------------------------------------- commands proposed by a session
+# The orchestrator runs the test and e2e commands itself, with a shell and the developer's full
+# environment, outside the permission classifier that guards a session's own Bash calls. Sessions
+# propose those commands, and a session's input (the spec, a README, a page it fetched) is not
+# trusted. So a proposed command has to look like a toolchain invocation: every segment starts with
+# a known build/test binary, and nothing in it fetches or evaluates code. A command the developer
+# passed on the command line is used as typed and never checked here.
+CMD_ALLOWLIST = {
+    "cd", "true", "echo", "sleep", "wait-on", "wait-for-it",
+    "make", "just", "task", "mise", "nox", "tox", "hatch", "invoke", "set",
+    "python", "python3", "py", "pytest", "coverage", "uv", "uvx", "pip", "pip3", "poetry",
+    "pipenv", "pdm", "manage.py", "django-admin", "alembic", "ruff", "mypy", "black", "flake8",
+    "pylint", "isort", "bandit",
+    "node", "npm", "npx", "pnpm", "yarn", "bun", "bunx", "deno", "vitest", "jest", "mocha",
+    "playwright", "cypress", "eslint", "prettier", "tsc", "vite", "turbo", "nx", "lerna", "rush",
+    "cargo", "rustup", "rustc",
+    "go", "gotestsum", "golangci-lint",
+    "swift", "xcodebuild", "xcrun", "fastlane", "swiftlint", "swiftformat", "xcpretty", "xcbeautify",
+    "dotnet", "mvn", "mvnw", "gradle", "gradlew", "mix", "rake", "bundle", "rspec", "rubocop",
+    "composer", "phpunit", "php", "artisan",
+    "cmake", "ctest", "ninja", "meson", "bazel", "buck2", "scons", "bear",
+    "sbt", "lein", "clojure", "clj", "stack", "cabal",
+    "flutter", "dart", "zig", "nim", "crystal", "elm", "tee",
+    "docker", "docker-compose", "podman", "podman-compose",
+}
+CMD_WRAPPERS = {"env", "nohup", "time", "timeout", "stdbuf", "xvfb-run", "caffeinate"}
+CMD_FORBIDDEN = (
+    (re.compile(r"\$\(|`"), "command substitution"),
+    (re.compile(r"\b(sudo|doas)\b"), "privilege escalation"),
+    (re.compile(r"\b(curl|wget|ssh|scp|rsync)\b"), "network transfer"),
+    (re.compile(r"\beval\b"), "eval"),
+    (re.compile(r"\brm\b\s+-\w*[rf]"), "recursive or forced delete"),
+    (re.compile(r"\b(sh|bash|zsh|ksh|fish|python3?|node|deno|perl|ruby|php|Rscript)\b\s+-[ce]\b"),
+     "inline script"),
+    (re.compile(r"\btee\b\s+(-\S+\s+)*(~|/(?!dev/null\b))"), "writing outside the repository"),
+    (re.compile(r">>?\s*(~|/(?!dev/null\b))"), "redirection outside the repository"),
+    (re.compile(r"\b(chmod|chown|killall|launchctl|crontab|systemctl)\b"), "system modification"),
+)
+CMD_MAX_LEN = 400
+
+
+def command_head(segment: str):
+    """The binary a shell segment starts with, ignoring env assignments and wrappers."""
+    toks = segment.strip().split()
+    while toks:
+        raw = toks[0].strip("\'\"")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", raw):     # CI=1 npm test
+            toks.pop(0)
+            continue
+        name = Path(raw).name if "/" in raw else raw            # .venv/bin/pytest -> pytest
+        if name in CMD_WRAPPERS or raw.startswith("-") or re.fullmatch(r"[\d.]+[smh]?", raw):
+            toks.pop(0)
+            continue
+        return name
+    return None
+
+
+def command_allowed(cmd: str, extra=()) -> tuple:
+    """(ok, reason) for a command a session proposed. See the note above CMD_ALLOWLIST."""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return False, "empty"
+    if len(cmd) > CMD_MAX_LEN:
+        return False, f"longer than {CMD_MAX_LEN} characters"
+    for pat, why in CMD_FORBIDDEN:
+        if pat.search(cmd):
+            return False, why
+    allowed = CMD_ALLOWLIST | {str(x).strip() for x in (extra or ()) if str(x).strip()}
+    for segment in re.split(r"&&|\|\||;|\||&", cmd):
+        head = command_head(segment)
+        if head is not None and head not in allowed:
+            return False, f"`{head}` is not a known build or test command"
+    return True, ""
+
+
+CMD_FIELDS = {  # structured-output field -> the run flag that overrides it (empty: no flag)
+    "test_command": "test_cmd", "lint_command": "", "e2e_command": "e2e_cmd",
+    "e2e_up_command": "e2e_up_cmd", "e2e_down_command": "e2e_down_cmd",
+}
+CMD_CORRECTION = """The orchestrator will not run the command(s) you returned, so this step is not finished yet:
+
+{{problems}}
+
+It runs these itself, outside the permission classifier that checks your own Bash calls, so it only
+accepts a plain toolchain invocation: every segment has to start with a known build or test binary
+(make, uv, python, pytest, npm, npx, cargo, swift, xcodebuild, go, gradle, cmake, docker, ...),
+optionally chained with &&, and nothing may fetch or evaluate code, use sudo, or redirect outside
+the repository.
+
+Give the project a command of that shape instead of working around it: add the target to the
+Makefile, the script entry to package.json, or the equivalent for this stack, and commit that file
+as part of your work. Run the command to be sure it works, then return the corrected commands in the
+same structured output. Use `-` for a command that is genuinely not needed."""
 
 
 def render(name: str, **kw) -> str:
@@ -549,6 +646,7 @@ class Orchestrator:
         self.cfg = state["config"]
         self.guard = UsageGuard(self.cfg["threshold"], self.cfg["weekly_threshold"])
         self.child: subprocess.Popen | None = None
+        self.surface_proc: subprocess.Popen | None = None
         self.stop_flag = False
         self.supports_prompts_none = False
         self.autonomy = ""
@@ -578,6 +676,59 @@ class Orchestrator:
                            env={**os.environ, "AUTODEV_MSG": msg})
         except Exception as e:  # noqa: BLE001
             log(f"WARN notify failed: {e}")
+
+    def require_test_command(self, where: str) -> None:
+        """Stop rather than run all night certifying nothing.
+
+        With no test command `run_tests` reports every phase as passing without running anything,
+        so the whole branch would be committed, reviewed and documented unverified. Better to fail
+        here, minutes after launch, while somebody may still be awake."""
+        if (self.state.get("project") or {}).get("test_command", "").strip():
+            return
+        raise StepFailed(
+            f"{where} left no usable test command, so no phase would ever be verified. Pass "
+            "--test-cmd '<command>' and run the same command again to resume — a command you pass "
+            "is used as typed and never vetted. If a session proposed one and it was refused, the "
+            "reason is in the log and in .autodev/DECISIONS.md, and --allow-cmd <binary> accepts "
+            "that binary.")
+
+    def record_decision(self, line: str) -> None:
+        """Append a line to DECISIONS.md the same way the sessions do, so a human reads one list."""
+        try:
+            with open(AD / "DECISIONS.md", "a", encoding="utf-8") as f:
+                f.write(f"- [orchestrator/{self.state.get('step', '?')}] {line}\n")
+        except OSError as e:
+            log(f"WARN could not append to DECISIONS.md: {e}")
+
+    def vet_command(self, field: str, proposed: str, current: str = "") -> str:
+        """Take a command a session proposed only if it looks like a real toolchain command.
+
+        The orchestrator shells out to these itself, so they never pass the permission classifier
+        that guards a session's own Bash calls, and everything a session reads (the spec, a README,
+        a fetched page) can try to talk it into proposing something else. A rejected command leaves
+        the current one in place and is written to the log, the timeline and DECISIONS.md, never
+        silently dropped. Commands the developer passed on the command line do not come through here.
+        """
+        proposed = (proposed or "").strip()
+        current = (current or "").strip()
+        if not proposed or proposed == current:
+            return current
+        if proposed == "-":                     # the sentinel for "nothing to run"
+            return proposed
+        ok, why = command_allowed(proposed, self.cfg.get("allow_cmd") or ())
+        if not ok:
+            log(f"WARN {field}: refused the command this session proposed ({why}): "
+                f"{one_line(proposed, 200)}")
+            log(f"     keeping `{current or '(none)'}` — set it yourself with the matching flag, or "
+                f"allow its binary with --allow-cmd")
+            self.event("command", "refused", f"{field} ({why}): {one_line(proposed, 160)}")
+            self.record_decision(f"refused the proposed {field} `{one_line(proposed, 200)}` ({why}); "
+                                 f"kept `{current or '(none)'}`")
+            return current
+        log(f"{field} → {proposed}")
+        self.record_decision(f"{field} set to `{proposed}` by this session "
+                             f"(was `{current or '(none)'}`)")
+        return proposed
 
     def phase_dir(self, i: int) -> Path:
         ph = self.state["phases"][i]
@@ -814,12 +965,34 @@ class Orchestrator:
         out["seconds"] = secs
         return out
 
-    def session(self, label, prompt, model, schema, required_key, extra_disallowed=()):
-        """Run one logical step to completion: handles limit pauses, resumes, nudges, restarts."""
+    def command_complaint(self, data: dict, fields) -> str | None:
+        """The message to send back when a session proposed a command the orchestrator will not run."""
+        problems = []
+        for field in fields:
+            flag = CMD_FIELDS.get(field, "")
+            if flag and (self.cfg.get(flag) or "").strip():
+                continue            # the developer set this one; whatever the session says is ignored
+            val = (data.get(field) or "").strip()
+            if not val or val == "-":
+                continue
+            ok, why = command_allowed(val, self.cfg.get("allow_cmd") or ())
+            if not ok:
+                problems.append(f"- `{field}`: `{one_line(val, 200)}` — {why}")
+        if not problems:
+            return None
+        return CMD_CORRECTION.replace("{{problems}}", "\n".join(problems))
+
+    def session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None):
+        """Run one logical step to completion: handles limit pauses, resumes, nudges, restarts.
+
+        `recheck` gets the structured output and returns a complaint to send back, or None. The
+        session gets one chance to correct itself; after that the step goes on with what it returned
+        and the caller decides what to keep."""
         prompt = (prompt + "\n\n---\nFinish by returning structured output matching this JSON schema "
                   "(if structured output is unavailable, end your final message with one ```json block):\n"
                   f"```json\n{json.dumps(schema, indent=1)}\n```\n")
-        resume, cur, nudges, rejections, total_secs, total_cost = None, prompt, 0, 0, 0, 0.0
+        resume, cur, nudges, total_secs, total_cost = None, prompt, 0, 0, 0.0
+        rejections, corrections = 0, 0
         act = self.state.get("active_session")
         if act and act.get("label") == label and act.get("session_id"):
             resume, cur = act["session_id"], RESUME_AFTER_RESTART
@@ -852,6 +1025,12 @@ class Orchestrator:
                 return {"status": "partial", "summary": "session timed out"}
             data = extract_json(out["result"], required_key)
             if data is not None:
+                complaint = recheck(data) if recheck else None
+                if complaint and out["session_id"] and corrections < 1:
+                    corrections += 1
+                    log(f"{label}: the commands it returned are not runnable — asking it to correct them")
+                    resume, cur = out["session_id"], complaint
+                    continue
                 self.state["active_session"] = None
                 status = data.get("status") or data.get("verdict") or "done"
                 self.event(label, status, data.get("summary", ""), total_secs, round(total_cost, 2))
@@ -927,41 +1106,104 @@ class Orchestrator:
     def e2e_configured(self) -> bool:
         return self.cfg.get("e2e") != "off" and bool(self.e2e_command())
 
+    def _spawn_logged(self, cmd: str, label: str) -> subprocess.Popen:
+        """Start a lifecycle command with its output going to a file, never to a pipe.
+
+        A command that starts a server and exits leaves that server holding the stdout it
+        inherited, so reading a pipe to end-of-file would block until the server itself stops —
+        the up command would look like it never returned. A file has no such reader."""
+        SURFACE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(SURFACE_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n$ {cmd}\n# {label} — {ts()}\n")
+            f.flush()
+            return subprocess.Popen(cmd, shell=True, stdout=f, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, env=child_env(), start_new_session=True)
+
+    @staticmethod
+    def _url_ready(url: str) -> bool:
+        """True when something answers — any status below 500 means the surface is listening."""
+        try:
+            with urllib.request.urlopen(url, timeout=5):
+                return True
+        except urllib.error.HTTPError as e:
+            return e.code < 500
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+    def _wait_ready(self, url: str, seconds: int) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._url_ready(url):
+                return True
+            time.sleep(3)
+        return False
+
     def surfaces_up(self) -> bool:
         """Start whatever the e2e suite attaches to. The suite never starts an app itself.
 
         Called once per e2e step, so the command must be idempotent: starting an already-running
-        surface has to succeed rather than fail on a taken port."""
-        cmd = (self.state.get("project") or {}).get("e2e_up_command") or ""
-        if cmd and cmd.strip() != "-":
+        surface has to succeed rather than fail on a taken port. It should also return once the
+        surfaces are up. A command that stays in the foreground instead only works with
+        --e2e-ready-url, which then decides when the surfaces are ready."""
+        cmd = ((self.state.get("project") or {}).get("e2e_up_command") or "").strip()
+        url = (self.cfg.get("e2e_ready_url") or "").strip()
+        if cmd and cmd != "-":
             log(f"e2e surfaces up: {cmd}")
-            ok, summary = self._shell(cmd, 15, label="e2e up")
-            if not ok:
-                self.event("e2e-up", "failed", summary)
+            proc = self._spawn_logged(cmd, "e2e up")
+            self.surface_proc = proc
+            deadline, probed = time.time() + 15 * 60, 0.0
+            while proc.poll() is None and time.time() < deadline:
+                if url and time.time() - probed > 3:
+                    probed = time.time()
+                    if self._url_ready(url):
+                        log("e2e up is still in the foreground but the ready URL answers — continuing")
+                        return True
+                time.sleep(0.5)
+            if proc.poll() is None:
+                self._kill_surface_proc()
+                self.event("e2e-up", "failed", "the up command never returned within 15 min; it must "
+                           "start the surfaces and exit, or answer --e2e-ready-url while it runs")
                 return False
-        url = self.cfg.get("e2e_ready_url")
-        if url:
-            deadline = time.time() + 180
-            while time.time() < deadline:
-                try:
-                    with urllib.request.urlopen(url, timeout=5):
-                        break
-                except (urllib.error.HTTPError,) as e:
-                    if e.code < 500:
-                        break
-                except (urllib.error.URLError, OSError, ValueError):
-                    pass
-                time.sleep(3)
-            else:
-                self.event("e2e-up", "failed", f"{url} never answered")
+            self.surface_proc = None
+            if proc.returncode != 0:
+                self.event("e2e-up", "failed", f"exit {proc.returncode} — see {SURFACE_LOG.as_posix()}")
                 return False
+        if url and not self._wait_ready(url, 180):
+            self.event("e2e-up", "failed", f"{url} never answered")
+            return False
         return True
 
+    def _kill_surface_proc(self) -> None:
+        """Stop an up command still running in the foreground, and the group it started."""
+        proc = self.surface_proc
+        self.surface_proc = None
+        if not proc or proc.poll() is not None:
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+                proc.wait(timeout=20)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+            except (ProcessLookupError, OSError):
+                return
+
     def surfaces_down(self) -> None:
-        cmd = (self.state.get("project") or {}).get("e2e_down_command") or ""
-        if cmd and cmd.strip() != "-":
+        cmd = ((self.state.get("project") or {}).get("e2e_down_command") or "").strip()
+        if cmd and cmd != "-":
             log(f"e2e surfaces down: {cmd}")
-            self._shell(cmd, 10, label="e2e down")
+            proc = self._spawn_logged(cmd, "e2e down")
+            try:
+                proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                log("WARN the e2e down command did not finish within 10 min — killing it")
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                except (ProcessLookupError, OSError):
+                    pass
+        self._kill_surface_proc()
 
     def run_e2e(self, pdir: Path):
         cmd = self.e2e_command()
@@ -1016,21 +1258,24 @@ class Orchestrator:
         """Design of record before any roadmap: architecture, ADRs, risks, and the real commands."""
         st, cfg = self.state, self.cfg
         res = self.session("architect", render("architect", spec=st["spec"], lang=cfg["lang"]),
-                           cfg["model_plan"], ARCH_SCHEMA, "summary")
+                           cfg["model_plan"], ARCH_SCHEMA, "summary",
+                           recheck=lambda d: self.command_complaint(d, CMD_FIELDS))
         if res.get("status") == "blocked":
             raise StepFailed(f"architect step blocked: {res.get('summary')}")
         if not (AD / "ARCHITECTURE.md").exists():
             raise StepFailed("architect step did not create .autodev/ARCHITECTURE.md")
 
         def pick(key, cfg_key):
-            """A command the developer passed on the command line always wins over the agent's."""
-            return (cfg.get(cfg_key) or "").strip() or (res.get(key) or "").strip()
+            """A command the developer passed on the command line wins, and is trusted as typed;
+            anything this session proposed has to pass vet_command first."""
+            return (cfg.get(cfg_key) or "").strip() or self.vet_command(key, res.get(key) or "")
 
         st["project"] = {
             **st.get("project", {}),
             "stack": res.get("stack", ""),
-            "test_command": cfg["test_cmd"] or (res.get("test_command") or "").strip(),
-            "lint_command": (res.get("lint_command") or "").strip(),
+            "test_command": cfg["test_cmd"] or self.vet_command("test_command",
+                                                               res.get("test_command") or ""),
+            "lint_command": self.vet_command("lint_command", res.get("lint_command") or ""),
             "e2e_command": pick("e2e_command", "e2e_cmd"),
             "e2e_up_command": pick("e2e_up_command", "e2e_up_cmd"),
             "e2e_down_command": pick("e2e_down_command", "e2e_down_cmd"),
@@ -1042,17 +1287,20 @@ class Orchestrator:
         self.commit("autodev: architecture, ADRs and risk register",
                     one_line(res.get("summary"), 400) + "\n\nFrom " + st["spec"])
         self.publish()
+        self.require_test_command("the architect step")
 
     def step_roadmap(self) -> None:
         st, cfg = self.state, self.cfg
         res = self.session("roadmap", render("roadmap", spec=st["spec"], lang=cfg["lang"]),
-                           cfg["model_plan"], ROADMAP_SCHEMA, "phases")
+                           cfg["model_plan"], ROADMAP_SCHEMA, "phases",
+                           recheck=lambda d: self.command_complaint(d, ("test_command",)))
         if not res.get("phases"):
             raise StepFailed("roadmap session returned no phases")
+        cur_test = (st.get("project") or {}).get("test_command", "")
         st["project"] = {**st.get("project", {}),
                          "name": res.get("project_name") or Path.cwd().name, "summary": res.get("summary", ""),
-                         "test_command": cfg["test_cmd"] or res.get("test_command", "").strip()
-                         or (st.get("project") or {}).get("test_command", "")}
+                         "test_command": cfg["test_cmd"] or self.vet_command(
+                             "test_command", res.get("test_command") or "", cur_test)}
         seen = set()
         st["phases"] = []
         for k, ph in enumerate(res["phases"], 1):
@@ -1078,6 +1326,7 @@ class Orchestrator:
         self.set_step("plan")
         self.commit(f"autodev: roadmap ({len(st['phases'])} phases)", "Generated from " + st["spec"])
         self.publish()
+        self.require_test_command("the roadmap step")
 
     def step_phase(self) -> None:
         st, cfg = self.state, self.cfg
@@ -1101,15 +1350,15 @@ class Orchestrator:
                 ctx.update(base_sha=git("rev-parse", "HEAD"), impl_runs=0, test_fix_attempts=0,
                            review_round=0, warnings=[])
             ph["status"] = "in_progress"
-            res = self.session(label, render("plan", **common), cfg["model_plan"], STEP_SCHEMA, "status")
+            res = self.session(label, render("plan", **common), cfg["model_plan"], STEP_SCHEMA, "status",
+                               recheck=lambda d: self.command_complaint(d, ("test_command",)))
             if res["status"] == "blocked":
                 raise StepFailed(f"phase {n} plan blocked: {res.get('summary')}")
             if not (pdir / "PLAN.md").exists():
                 raise StepFailed(f"phase {n}: PLAN.md was not created")
-            new_cmd = (res.get("test_command") or "").strip()
-            if new_cmd and not cfg["test_cmd"] and new_cmd != st["project"].get("test_command"):
-                st["project"]["test_command"] = new_cmd
-                log(f"test command updated → {new_cmd}")
+            if not cfg["test_cmd"]:
+                st["project"]["test_command"] = self.vet_command(
+                    "test_command", res.get("test_command") or "", st["project"].get("test_command", ""))
             self.set_step("implement")
 
         elif step == "implement":
@@ -1128,10 +1377,14 @@ class Orchestrator:
                 self.set_step("test")
 
         elif step == "test":
+            if not (proj.get("test_command") or "").strip():
+                ctx["warnings"].append("no test command configured — the unit suite never ran")
             ok, summary = self.run_tests(pdir)
             self.event(f"p{n:02d}-tests", "pass" if ok else "fail", summary)
             if ok:
-                self.set_step("review" if ctx["review_round"] < cfg["max_review_rounds"] else "commit")
+                # out of review rounds is not a reason to skip end-to-end QA and the documentation
+                self.set_step("review" if ctx["review_round"] < cfg["max_review_rounds"]
+                              else self.after_review(ph))
             elif ctx["test_fix_attempts"] >= cfg["max_test_fix"]:
                 raise StepFailed(f"phase {n}: tests still failing after {ctx['test_fix_attempts']} fix attempts "
                                  f"(see {pdir.as_posix()}/TEST_OUTPUT.txt)")
@@ -1192,19 +1445,19 @@ class Orchestrator:
                     self.set_step(self.after_e2e())
                     return
                 res = self.session(label, render("e2e", **common), cfg["model_qa"], E2E_SCHEMA, "status",
-                                   extra_disallowed=())
-                for key, skey in (("e2e_command", "e2e_command"), ("e2e_up_command", "e2e_up_command"),
-                                  ("e2e_down_command", "e2e_down_command")):
-                    val = (res.get(key) or "").strip()
-                    cfg_key = {"e2e_command": "e2e_cmd", "e2e_up_command": "e2e_up_cmd",
-                               "e2e_down_command": "e2e_down_cmd"}[key]
-                    if val and not cfg.get(cfg_key) and val != st["project"].get(skey):
-                        st["project"][skey] = val
-                        log(f"{skey} → {val}")
+                                   recheck=lambda d: self.command_complaint(
+                                       d, ("e2e_command", "e2e_up_command", "e2e_down_command")))
+                for key, cfg_key in (("e2e_command", "e2e_cmd"), ("e2e_up_command", "e2e_up_cmd"),
+                                     ("e2e_down_command", "e2e_down_cmd")):
+                    if not cfg.get(cfg_key):
+                        st["project"][key] = self.vet_command(key, res.get(key) or "",
+                                                              st["project"].get(key, ""))
                 if res["status"] == "blocked":
                     ctx["warnings"].append(f"e2e blocked: {one_line(res.get('summary'), 160)}")
                     self.set_step(self.after_e2e())
                     return
+                if not self.e2e_command():
+                    ctx["warnings"].append("no e2e command configured — the end-to-end suite never ran")
                 ok, summary = self.run_e2e(pdir)
                 self.event(f"p{n:02d}-e2e", "pass" if ok else "fail", summary)
                 if ok:
@@ -1519,7 +1772,8 @@ def cmd_doctor(args) -> int:
         guesses.append("go test ./...")
     if Path("Cargo.toml").exists():
         guesses.append("cargo test")
-    rep("INFO", "test command guess: " + (", ".join(guesses) if guesses else "none (architect step will decide)"))
+    rep("INFO", "test command guess: " + (", ".join(guesses) if guesses else "none")
+        + " — the architect step decides, and the run stops if it cannot name one; --test-cmd settles it")
     prof = getattr(args, "profile", None) or detect_profile()
     known = available_profiles()
     rep("OK" if prof in known else "FAIL",
@@ -1580,6 +1834,9 @@ def main() -> int:
     run.add_argument("--no-branch", dest="branch", action="store_const", const=False)
     run.add_argument("--no-caffeinate", dest="caffeinate", action="store_const", const=False)
     run.add_argument("--claude-bin", dest="claude_bin")
+    run.add_argument("--allow-cmd", dest="allow_cmd", action="append", metavar="BINARY",
+                     help="also accept commands starting with BINARY when a session proposes one "
+                          "(repeatable); commands you pass yourself are never checked")
     run.add_argument("--gh-user", dest="gh_user", help="gh account login to commit & push as")
     run.add_argument("--gh-host", dest="gh_host", help="default github.com")
     run.add_argument("--gh-repo", dest="gh_repo", help="owner/name (default: from the remote URL)")

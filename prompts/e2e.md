@@ -44,7 +44,10 @@ Do not touch the unit suite's assertions to make room for e2e. Do not commit.
 
 If `.autodev/PROFILE.md` has no usable e2e command yet, create the harness and return the exact commands you made
 work in `e2e_command` / `e2e_up_command` / `e2e_down_command` (use `-` when nothing needs starting); otherwise
-return empty strings.
+return empty strings. The orchestrator runs them itself and accepts only plain toolchain invocations — each segment
+starting with a known build or test binary, nothing that fetches or evaluates code — so express the lifecycle with
+the runner directly (`npm`, `uv`, `docker`, `make`, …) rather than through a shell script of your own.
+`e2e_up_command` must return once the surfaces are up; background whatever keeps running.
 
 Structured output: status done|partial|blocked, summary (cases added, bugs found and fixed, anything deferred),
 e2e_command, e2e_up_command, e2e_down_command.

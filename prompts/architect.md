@@ -40,6 +40,12 @@ trust this file; leave nothing aspirational in it.
 
 Also append the assumptions you made to `.autodev/DECISIONS.md`.
 
+The orchestrator runs the commands you return, so it accepts only plain toolchain invocations: each one must
+start with a known build or test binary (`make`, `uv`, `python`, `pytest`, `npm`, `npx`, `cargo`, `swift`,
+`xcodebuild`, `go`, `docker`, `gradle`, …), optionally chained with `&&`. A command that fetches or evaluates code,
+needs `sudo`, or runs a shell script of the project's own is refused, and the run keeps whatever command it had.
+`e2e_up_command` must return once the surfaces are up — background what keeps running.
+
 Commands you return must be non-interactive and runnable from the repository root. If the project does not exist yet,
 give the commands that will work once phase 1 has created the skeleton — phase 1 is then responsible for making them
 true. Use `-` for a command that is genuinely not needed (for example an e2e suite that starts nothing).

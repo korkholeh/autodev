@@ -40,8 +40,15 @@ This is the last human input of the run. Everything unasked becomes a logged gue
 - If the doctor could not guess a test command and the stack is known, suggest `--test-cmd "<cmd>"`.
 - If the end-to-end suite needs services running (a web stack usually does), pass `--e2e-up-cmd`, `--e2e-down-cmd`
   and optionally `--e2e-ready-url`. The up command runs once per e2e step and must be **idempotent** — starting an
-  already-running surface has to succeed, not fail on a taken port. Left empty, the architect and e2e steps work
-  them out and write them down. `--e2e off` turns the end-to-end layer off entirely.
+  already-running surface has to succeed, not fail on a taken port — and it must **return** once the surfaces are up.
+  A command that stays in the foreground only works together with `--e2e-ready-url`. Left empty, the architect and
+  e2e steps work them out and write them down. `--e2e off` turns the end-to-end layer off entirely.
+- **Commands the sessions propose are vetted** against a toolchain allowlist before the orchestrator runs them; a
+  session that proposes something else is told why and corrects it once. If this project drives its suite through
+  its own script, pass `--allow-cmd <binary>` (or just pass the command yourself, which is never checked).
+- **A run with no test command stops at the architect step**, because otherwise every phase would report a passing
+  suite without running anything. If the doctor could not guess a test command, agreeing on one here is worth a
+  question.
 - Never point the e2e commands at production or at real user data.
 - **GitHub identity.** Commits/pushes use the account from `--gh-user <login>` (pass the same flag to `doctor`).
   If the user didn't pass it and the doctor lists several gh accounts while the repo has a GitHub remote,

@@ -47,7 +47,8 @@ architect ─► roadmap ─► for each phase:
 
 - **architect** — before any code: `ARCHITECTURE.md`, ADRs in `docs/dev/adr/`, a risk register `RISKS.md`,
   the exact stack commands in `.autodev/PROFILE.md`.
-- **e2e** — only for phases marked `user_facing` in the roadmap. First a plan with an oracle
+- **e2e** — only for phases marked `user_facing` in the roadmap. The up command must return once the surfaces
+  are up (a command that stays in the foreground needs `--e2e-ready-url`). First a plan with an oracle
   (`e2e/plans/<feature>.plan.yaml`), then the specs, then a run that fixes **the product**, not the tests.
   Services are brought up by the script (`--e2e-up-cmd`), not by the agent.
 - **docs** — `CLAUDE.md`, `docs/dev/` (for developers) and `docs/user/` (for users) + `CHANGELOG.md`.
@@ -88,7 +89,8 @@ from then on every session reads that file.
 | `--profile NAME` | stack profile (auto-detection by default) |
 | `--test-cmd CMD` | full test-suite command (otherwise the architect picks it) |
 | `--e2e auto\|off` | end-to-end QA on user-facing phases (`auto` by default) |
-| `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`, `--e2e-ready-url` | e2e suite and service lifecycle (the up command must be idempotent) |
+| `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`, `--e2e-ready-url` | e2e suite and service lifecycle (the up command must be idempotent and must return) |
+| `--allow-cmd BINARY` | also accept commands starting with `BINARY` when a session proposes one (repeatable) |
 | `--no-docs`, `--no-finalize` | disable the documentation step / the final session |
 | `--model-plan\|impl\|review\|qa` | models per step (opus / sonnet / opus / sonnet) |
 | `--max-test-fix`, `--max-e2e-fix`, `--max-review-rounds`, `--max-impl-runs` | loop limits |
@@ -131,6 +133,24 @@ undocumented `api/oauth/usage` (token from `~/.claude/.credentials.json` or the 
 `AUTODEV_KEYCHAIN_SERVICE="<the Keychain entry name>"`.
 
 ## Security
+
+**Commands proposed by a session are vetted.** The orchestrator runs the test and e2e commands itself, with a
+shell, so they never pass the permission classifier that guards a session's own Bash calls — and a session reads
+the spec, the repository and (unless you disable them) web pages, any of which can try to talk it into proposing
+something else. A proposed command is accepted only when every segment starts with a known toolchain binary
+(`make`, `uv`, `pytest`, `npm`, `cargo`, `swift`, `xcodebuild`, `go`, `cmake`, `gradle`, `docker`, …) and nothing
+in it fetches or evaluates code, escalates privileges, or redirects outside the repository. Commands **you** pass
+(`--test-cmd`, `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`) are used as typed and never checked.
+
+A command that does not pass costs nothing in the normal case: the session is told which command was refused and
+why, and given one chance to correct it — usually by adding a `make` target or an npm script and returning that
+instead. Only if it insists is the command dropped, which is logged, recorded in `DECISIONS.md`, and leaves the
+previous command in place. To let a project's own script through from the start, pass `--allow-cmd <binary>`.
+
+**A run with no test command stops.** With none configured every phase would report a passing suite without running
+anything, so the branch would be committed, reviewed and documented unverified. If the architect and roadmap steps
+both end without a usable test command, the run fails there — minutes after launch — and tells you to pass
+`--test-cmd`. Resume with the same `run` command once you have.
 
 By default `--permission-mode auto` (a classifier checks the actions) + `--permission-prompts none`.
 `--permission-mode bypass` — only inside Docker/a VM. User hooks from `~/.claude` also run in the sessions —
