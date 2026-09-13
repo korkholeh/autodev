@@ -524,6 +524,17 @@ class RunEntry(TempCwd):
             autodev.cmd_run(self.args(spec="docs/spec.md", adopt=True))
         self.assertNotIn("ignored", out.getvalue())
 
+    def test_doctor_does_not_call_an_empty_repository_detached(self):
+        """Regression: `rev-parse --abbrev-ref HEAD` answers "HEAD" before the first commit too."""
+        subprocess.run(["git", "init", "-q", "."], check=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            autodev.cmd_doctor(argparse.Namespace(
+                spec=None, gh_user=None, git_email=None, git_name=None, no_smoke=True,
+                claude_bin="/nonexistent-claude", profile=None, gh_host=None, gh_repo=None, remote=None))
+        self.assertIn("no commits yet", out.getvalue())
+        self.assertNotIn("detached HEAD", out.getvalue())
+
     def test_a_detached_head_stops_the_run_before_it_starts(self):
         autodev.git = lambda *a, **kw: "HEAD"
         with self.assertRaises(util.StepFailed) as e:

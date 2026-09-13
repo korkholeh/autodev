@@ -1630,10 +1630,15 @@ def cmd_doctor(args) -> int:
             rep("OK" if git("config", "user.email", check=False) else "FAIL", "git identity (user.email)")
         if not (args.gh_user or args.git_name):
             rep("OK" if git("config", "user.name", check=False) else "FAIL", "git identity (user.name)")
-        head = git("rev-parse", "--abbrev-ref", "HEAD", check=False)
-        rep("FAIL" if head == "HEAD" else "OK",
-            "git: detached HEAD — check out a branch first, the run needs a base branch to return to"
-            if head == "HEAD" else f"git: on branch {head or '(unborn)'}")
+        born = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode == 0
+        head = git("rev-parse", "--abbrev-ref", "HEAD", check=False) if born else ""
+        if not born:      # a repository with no commits reports "HEAD" too, and is perfectly fine
+            rep("OK", "git: no commits yet — the run makes the first one on "
+                      + (git("symbolic-ref", "--short", "HEAD", check=False) or "the current branch"))
+        else:
+            rep("FAIL" if head == "HEAD" else "OK",
+                "git: detached HEAD — check out a branch first, the run needs a base branch to return to"
+                if head == "HEAD" else f"git: on branch {head}")
         rep("OK" if Path(".gitignore").exists() else "WARN",
             "root .gitignore" + ("" if Path(".gitignore").exists() else
                                  " missing — whatever a session installs or generates lands in the index; "
