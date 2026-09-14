@@ -90,6 +90,7 @@ class PhaseHarness:
         self.status = []                     # consumed one per `git status --porcelain` call
         self.e2e_ok = [True] * 50
         self.plan_tasks = "- [x] T1: done\n"
+        self.changed_files = "src/app.py\nREADME.md\n"
         self.surfaces_start = True
 
         self.o.session = self._session
@@ -115,6 +116,8 @@ class PhaseHarness:
             return self.status.pop(0) if self.status else ""
         if args[:1] == ("write-tree",):
             return "t" * 40
+        if args[:2] == ("diff", "--name-only"):
+            return self.changed_files
         return ""
 
     def _session(self, label, prompt, model, schema, key, extra_disallowed=(), recheck=None,
@@ -175,6 +178,29 @@ class PhaseRouting(TempCwd):
     def test_e2e_off_skips_e2e_everywhere(self):
         h = self.drive(e2e="off")
         self.assertNotIn("e2e", h.run())
+
+    def test_a_phase_that_changed_no_real_file_skips_the_documentation_step(self):
+        h = self.drive()
+        h.changed_files = ".autodev/phases/01-p1/PLAN.md\n.autodev/DECISIONS.md\n"
+        route = h.run()
+        self.assertNotIn("p01-docs", h.labels)               # no session was started
+        self.assertIn("docs", route)                         # the step ran and decided not to
+        self.assertTrue(any(e["status"] == "skipped" for e in h.state["events"]))
+
+    def test_the_documentation_step_is_told_what_changed(self):
+        h = self.drive()
+        h.changed_files = "src/app.py\ndocs/user/cli.md\n"
+        h.run()
+        docs = next(p for p in h.prompts if p.startswith("Step: DOCUMENTATION"))
+        self.assertIn("`src/app.py`", docs)
+        self.assertIn("`docs/user/cli.md`", docs)
+        self.assertNotIn("{{", docs)
+
+    def test_documentation_that_needed_no_change_is_recorded(self):
+        h = self.drive()
+        h.status = []                                        # the tree looks the same before and after
+        h.run()
+        self.assertTrue(any(e["status"] == "no changes" for e in h.state["events"]))
 
     def test_docs_can_be_turned_off(self):
         h = self.drive(docs=False)
@@ -2311,6 +2337,43 @@ class StackedPullRequests(TempCwd):
         o = self.orch([self.phase(1)])
         self.assertFalse(o.phase_branch(0).startswith(o.state["branch"] + "/"))
         self.assertTrue(o.phase_branch(0).startswith(o.state["branch"] + "-"))
+
+
+class EmptyBranch(TempCwd):
+    """`gh pr create` on a branch with no commits fails, so it is not called."""
+
+    def orch(self, ahead):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state.update(branch="autodev/x", base_branch="main", run_base_sha="b" * 40)
+        state["config"]["pr"] = "single"
+        Path(".autodev/logs").mkdir(parents=True, exist_ok=True)
+        o = autodev.Orchestrator(state)
+        o.notify = lambda msg: None
+        o.render_progress = lambda: (autodev.AD / "PROGRESS.md").write_text("progress\n")
+        autodev.git = lambda *a, **kw: str(ahead) if a[:2] == ("rev-list", "--count") else ""
+        self.addCleanup(lambda: None)
+        gh = autodev.GitHub("me")
+        gh.token, gh.login, gh.repo = "t", "me", "owner/repo"
+        gh.push = lambda branch, src="HEAD": None
+        gh.ensure_base = lambda b: False
+        self.created = []
+        gh.sync_pr = lambda *a: self.created.append(a) or "https://x/pull/1"
+        o.github = gh
+        o.push_mode = "phase"
+        return o
+
+    def test_an_empty_branch_gets_pushed_but_no_pull_request(self):
+        """Regression: the architect and roadmap pushes failed `pr create` twice per run."""
+        o = self.orch(ahead=0)
+        o.publish()
+        self.assertEqual(self.created, [])
+        self.assertEqual([e["status"] for e in o.state["events"]], ["done"])     # the push, and nothing failed
+
+    def test_the_first_commit_brings_the_pull_request(self):
+        o = self.orch(ahead=1)
+        o.publish()
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(o.state["pr_url"], "https://x/pull/1")
 
 
 class PullRequestBase(TempCwd):

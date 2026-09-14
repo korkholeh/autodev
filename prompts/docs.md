@@ -2,8 +2,18 @@ Step: DOCUMENTATION — phase {{n}}/{{total}}: "{{title}}"
 
 The phase is built, tested and reviewed. Make the documentation true again before it is committed.
 
-Read: `{{phase_dir}}/PLAN.md`, this phase's diff (`git diff {{base_sha}}`), `.autodev/ARCHITECTURE.md`,
-this phase's decisions (`{{decisions_tail}}`), and the current `CLAUDE.md`, `docs/dev/`, `docs/user/`.
+This phase changed these files:
+
+{{changed}}
+
+Read: `{{phase_dir}}/PLAN.md`, the diff of what you need (`git diff {{base_sha}} -- <path>`), `.autodev/ARCHITECTURE.md`,
+this phase's decisions (`{{decisions_tail}}`), and the documents that cover the surfaces above — not every document
+in the repository.
+
+The implementation and the review fixes update documentation as they go, so most of this is usually already done.
+Verify it against the files listed, fix what is missing or stale, and change nothing else: if the documentation is
+already true, say so and return `done` without editing anything. Do not rewrite prose that is merely not how you
+would have put it.
 
 Guides: `.autodev/guides/write-project-docs.md` for anything a developer reads,
 `.autodev/guides/user-docs.md` for anything a user reads.

@@ -321,6 +321,17 @@ read-only, sees that diff and the review it answered, and asks three questions: 
 fixed in the product and covered by a test, did the fixes break anything else, and was any rejected finding argued
 in `DECISIONS.md`. It approves, or the phase gets one more fix pass and lands with a warning naming the audit file.
 
+**No pull request until there is a commit in it.** `gh pr create` on a branch with nothing on it fails with "No
+commits between main and …", which the architect and roadmap pushes did on every run — two failures in the timeline
+that read like something was wrong with the repository. The branch is still pushed; the draft PR waits for the
+first phase to land.
+
+**The documentation step is scoped to what changed.** The implementation and the review fixes update docs as they
+go, so four of the seven phases of that run spent a session to conclude "no changes needed". It still gets checked,
+but the session is handed the list of files the phase changed and told to check the documents covering those and
+nothing else — and a phase that changed nothing outside `.autodev/` skips the step entirely. When the session
+changes no file, the timeline says so rather than leaving a summary that reads like work.
+
 **The decision log is read in slices.** `DECISIONS.md` is the one file that grows all night — 164 KB and 216
 entries by the end of that run — and every plan, implementation and review was told to read it whole, which by the
 last phase was tens of thousands of tokens of fixed tax per session. The sessions' own headings did not help: 23 of

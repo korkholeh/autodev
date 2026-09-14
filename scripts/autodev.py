@@ -1540,6 +1540,21 @@ class Orchestrator:
                          + ("  ✅ merged" if tail.get("merged") else ""))
         return "\n".join(lines + [""])
 
+    def commits_on_branch(self) -> int:
+        """How many commits this run has made. Zero until the first phase lands.
+
+        `gh pr create` on an empty branch fails with "No commits between main and …", which the
+        architect and roadmap pushes did twice per run — two failures in the timeline that read like
+        something was wrong with the repository."""
+        start = self.state.get("run_base_sha")
+        if not start:
+            return 1
+        out = git("rev-list", "--count", f"{start}..HEAD", check=False)
+        count = int(out) if out.isdigit() else 1
+        if not count:
+            log("no commits on the branch yet — the draft pull request waits for the first one")
+        return count
+
     def publish(self, final: bool = False) -> None:
         """Push the branch (and sync the draft PR). Never raises: failures are logged and retried next time."""
         if self.push_mode == "never" or (self.push_mode == "end" and not final):
@@ -1566,7 +1581,7 @@ class Orchestrator:
                 where = f"{cfg['remote']}/{branch}"
             self.event("push", "done", where)
             base = st.get("base_branch")
-            if self.pr_mode() and self.github and base and base != branch:
+            if self.pr_mode() and self.github and base and base != branch and self.commits_on_branch():
                 self.render_progress()
                 title = f"autodev: {(st.get('project') or {}).get('name') or branch}"
                 def umbrella(map_md):
@@ -1955,9 +1970,30 @@ class Orchestrator:
         return "e2e_fix"
 
     def _docs(self, run: "PhaseRun") -> str:
-        res = self.session(run.label, render("docs", **run.common), self.cfg["model_impl"], STEP_SCHEMA, "status")
+        """Make the documentation true — for what this phase actually changed.
+
+        The implementation and the review fixes already update docs as they go, so four of the seven
+        phases of the run this was written for spent a session to conclude "no changes needed". It
+        still has to be checked, but it can be checked against a list of changed files instead of a
+        whole phase rediscovered from scratch — and a phase that changed nothing outside `.autodev/`
+        has nothing to document at all."""
+        git("add", "-A")
+        changed = [f for f in git("diff", "--name-only", run.ctx.get("base_sha", ""), check=False).splitlines()
+                   if f and not f.startswith(".autodev/")]
+        if not changed:
+            log(f"phase {run.n}: nothing outside .autodev/ changed — skipping the documentation step")
+            self.event(run.label, "skipped", "the phase changed no file a document could describe")
+            return "commit"
+        shown = "\n".join(f"- `{f}`" for f in changed[:40])
+        if len(changed) > 40:
+            shown += f"\n- …and {len(changed) - 40} more"
+        marks = self.worktree_marks()
+        res = self.session(run.label, render("docs", changed=shown, **run.common),
+                           self.cfg["model_impl"], STEP_SCHEMA, "status")
         if res["status"] == "blocked":
             run.ctx["warnings"].append(f"docs blocked: {one_line(res.get('summary'), 160)}")
+        elif self.worktree_marks() == marks:
+            self.event(run.label, "no changes", "the documentation was already true for this phase")
         return "commit"
 
     def _commit(self, run: "PhaseRun") -> str:
