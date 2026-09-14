@@ -24,6 +24,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -508,7 +509,8 @@ class Interruption(TempCwd):
         o = self.orch()
         o.note_session("p01-plan", "sess-123")
         on_disk = json.loads(Path(".autodev/state.json").read_text())
-        self.assertEqual(on_disk["active_session"], {"label": "p01-plan", "session_id": "sess-123"})
+        self.assertEqual(on_disk["active_session"]["label"], "p01-plan")
+        self.assertEqual(on_disk["active_session"]["session_id"], "sess-123")
 
     def test_killing_a_session_takes_what_it_started_with_it(self):
         """A session starts test runs and dev servers; only killing claude leaves them holding ports."""
@@ -670,6 +672,108 @@ class CommandFiles(TempCwd):
             self.assertIsNone(staging.COMMAND_FILES.search(name), name)
 
 
+class ResumeHandle(TempCwd):
+    """The handle has to survive the step being called something slightly different."""
+
+    def orch(self, running=True, step="review", phase_index=3):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state.update(step=step, phase_index=phase_index,
+                     active_session={"label": "p04-review1", "session_id": "s1", "step": step,
+                                     "phase_index": phase_index} if running else None)
+        Path(".autodev").mkdir(exist_ok=True)
+        return autodev.Orchestrator(state)
+
+    def test_the_same_label_resumes(self):
+        self.assertEqual(self.orch().resume_handle("p04-review1"), "s1")
+
+    def test_a_renamed_step_still_resumes_its_own_session(self):
+        """Regression: interrupted as p04-review1, restarted as p04-review2, resumed nothing —
+        95 seconds of an opus review paid for and thrown away."""
+        self.assertEqual(self.orch().resume_handle("p04-review2"), "s1")
+
+    def test_another_step_does_not_inherit_it(self):
+        o = self.orch()
+        o.state["step"] = "docs"
+        self.assertEqual(o.resume_handle("p04-docs"), "")
+
+    def test_another_phase_does_not_inherit_it(self):
+        o = self.orch()
+        o.state["phase_index"] = 4
+        self.assertEqual(o.resume_handle("p05-review1"), "")
+
+    def test_a_handle_written_before_this_existed_still_matches_its_label(self):
+        o = self.orch()
+        o.state["active_session"] = {"label": "p04-review1", "session_id": "s1"}
+        self.assertEqual(o.resume_handle("p04-review1"), "s1")
+        self.assertEqual(o.resume_handle("p04-review2"), "")
+
+    def test_nothing_running_means_nothing_to_resume(self):
+        self.assertEqual(self.orch(running=False).resume_handle("p04-review1"), "")
+
+
+class SessionStartup(TempCwd):
+    """A session that never started is a broken machine, not a broken step."""
+
+    CORRUPT = ("Claude configuration file at /Users/x/.claude.json is corrupted: JSON Parse error: "
+               "Unexpected EOF\nThe corrupted file has already been backed up.\n")
+
+    def make(self, *turns):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state["step"] = "review"
+        Path(".autodev/logs").mkdir(parents=True, exist_ok=True)
+        o = autodev.Orchestrator(state)
+        o.check_stop = lambda: None
+        o.wait_for_usage = lambda: False
+        o.notify = lambda msg: None
+        self.slept, calls, queue = [], [], list(turns)
+        o.sleep_with_stop = self.slept.append
+        base = {"session_id": None, "result": None, "interrupted": None, "rejected": False,
+                "exit": 1, "seconds": 0, "context": 0, "stderr": ""}
+
+        def run_claude(label, prompt, model, schema, resume=None, extra_disallowed=(), context_limit=0):
+            calls.append(resume)
+            return {**base, **queue.pop(0)}
+        o.run_claude = run_claude
+        return o, calls
+
+    def dead(self, stderr=""):
+        return {"stderr": stderr or self.CORRUPT}
+
+    def alive(self):
+        return {"session_id": "sid", "exit": 0,
+                "result": {"result": json.dumps({"status": "done", "summary": "s"})}}
+
+    def test_a_session_that_did_not_start_is_tried_again(self):
+        """Regression: a corrupted ~/.claude.json failed a whole overnight run at 22:44."""
+        o, calls = self.make(self.dead(), self.dead(), self.alive())
+        res = o.session("p01-review1", "GO", "opus", autodev.STEP_SCHEMA, "status")
+        self.assertEqual(res["status"], "done")
+        self.assertEqual(calls, [None, None, None])     # a fresh start each time, nothing to resume
+        self.assertEqual(self.slept, list(autodev.STARTUP_BACKOFF_S[:2]))
+        self.assertTrue(any(e["status"] == "did not start" for e in o.state["events"]))
+
+    def test_it_gives_up_saying_what_the_machine_said(self):
+        o, _ = self.make(*[self.dead()] * autodev.STARTUP_TRIES)
+        with self.assertRaises(util.StepFailed) as e:
+            o.session("p01-review1", "GO", "opus", autodev.STEP_SCHEMA, "status")
+        self.assertIn("did not start after 3 tries", str(e.exception))
+        self.assertIn("configuration file is corrupted", str(e.exception))
+        self.assertIn("JSON Parse error", str(e.exception))      # the machine's own words
+        self.assertTrue(o.state["run_warnings"])
+
+    def test_an_unknown_startup_failure_is_still_retried(self):
+        o, calls = self.make(self.dead("dyld: library not loaded\n"), self.alive())
+        o.session("p01-review1", "GO", "opus", autodev.STEP_SCHEMA, "status")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_session_that_started_is_nudged_not_restarted(self):
+        o, calls = self.make({"session_id": "sid", "result": {"result": "no json here"}},
+                             self.alive())
+        o.session("p01-review1", "GO", "opus", autodev.STEP_SCHEMA, "status")
+        self.assertEqual(calls, [None, "sid"])          # resumed, not started over
+        self.assertEqual(self.slept, [])
+
+
 class Budget(TempCwd):
     """The ceiling on a single run: the usage guard only keeps the subscription happy."""
 
@@ -700,12 +804,55 @@ class Budget(TempCwd):
             o.check_stop()
         self.assertIn("--max-sessions 2", str(e.exception))
 
-    def test_the_hour_ceiling_stops_the_run(self):
+    def test_the_hour_ceiling_lets_the_phase_in_flight_finish(self):
+        """Regression: it interrupted whatever was running, paid for it and threw it away."""
         o = self.orch(max_hours=1.5)
-        o.run_started = time.time() - 2 * 3600
+        o.run_started = time.time() - 2 * 3600          # half an hour over, inside the grace
+        self.assertIn("--max-hours 1.5", o.budget_spent())
+        self.assertIsNone(o.budget_exceeded())
+        o.check_stop()                                  # does not raise
+
+    def test_the_hour_ceiling_gives_up_once_the_grace_is_spent(self):
+        o = self.orch(max_hours=1)
+        o.run_started = time.time() - (2 * 3600 + autodev.BUDGET_GRACE_S)
         with self.assertRaises(util.StopRequested) as e:
             o.check_stop()
-        self.assertIn("--max-hours 1.5", str(e.exception))
+        self.assertIn("grace", str(e.exception))
+
+    def over_budget_run(self, step):
+        o = self.orch(max_hours=1)
+        o.state.update(step=step, phases=[{"title": "P", "slug": "p", "goal": "g", "deliverables": [],
+                                           "acceptance_criteria": [], "status": "pending"}])
+        o.budget_spent = lambda: "--max-hours 1 reached (2.0 h in this run)"
+        o.setup = lambda: None
+        o.acquire_lock = lambda: None
+        o.publish = lambda final=False: None
+        return o
+
+    def test_a_run_over_its_hours_stops_at_the_phase_boundary(self):
+        o = self.over_budget_run("plan")
+        o.step_phase = lambda: self.fail("started a phase it had no budget for")
+        self.assertEqual(o.run(), 130)
+        self.assertEqual(o.state["status"], "stopped")
+        self.assertIn("phase boundary", o.state["stop_reason"])
+
+    def test_a_phase_already_under_way_is_carried_to_its_end(self):
+        o = self.over_budget_run("implement")
+        steps = []
+        o.step_phase = lambda: steps.append(o.state["step"]) or o.set_step("plan")
+        self.assertEqual(o.run(), 130)
+        self.assertEqual(steps, ["implement"])          # it ran, and stopped at the next boundary
+        self.assertIn("phase boundary", o.state["stop_reason"])
+
+    def test_the_clock_separates_working_from_waiting(self):
+        o = self.orch()
+        o.state["created"] = datetime.fromtimestamp(time.time() - 4 * 3600).strftime("%Y-%m-%d %H:%M:%S")
+        o.state["totals"].update(seconds=3600, paused=7200)
+        line = o.clock_line()
+        self.assertIn("4.0 h since the run was created", line)
+        self.assertIn("1.0 h working", line)
+        self.assertIn("2.0 h paused", line)
+        self.assertIn("1.0 h not running", line)
 
     def test_a_usage_pause_past_the_deadline_stops_instead_of_sleeping(self):
         """Regression: the run slept until the limit reset, however late that was."""

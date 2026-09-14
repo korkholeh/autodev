@@ -52,6 +52,17 @@ from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE
 
 PERMISSION_PROMPTS_MIN = (2, 1, 259)  # first version with --permission-prompts none
 REVIEW_ATTEMPTS = 2                   # tries at one review round before the phase gives up on it
+BUDGET_GRACE_S = 3600                 # a phase already in flight gets this long past --max-hours
+BOUNDARY_STEPS = ("architect", "roadmap", "plan")   # where a run stops without leaving a phase half-built
+STARTUP_TRIES = 3                     # tries at a session that never got as far as a session id
+STARTUP_BACKOFF_S = (20, 90)          # waited between those tries
+# Claude Code prints these before it has a session, and then exits: the run has nothing to resume and
+# nothing to show for the step. A corrupted ~/.claude.json failed a whole overnight run this way.
+STARTUP_FAILURES = (
+    (re.compile(r"configuration file .* is corrupted|Configuration error in .*\.claude\.json"
+                r"|JSON Parse error", re.I),
+     "the Claude Code configuration file is corrupted; it prints the backup to restore from"),
+)
 
 
 def _has_git_remote() -> bool:
@@ -695,13 +706,20 @@ class Orchestrator:
         if over:
             raise StopRequested(over)
 
+    def wall_clock(self) -> float:
+        """Seconds since the run was created — which is not the same as time spent working."""
+        try:
+            return max(time.time() - datetime.strptime(self.state["created"], "%Y-%m-%d %H:%M:%S").timestamp(), 0.0)
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
     def budget_deadline(self) -> float:
         """When `--max-hours` runs out, or 0 if there is no ceiling."""
         hours = float(self.cfg.get("max_hours") or 0)
         return self.run_started + hours * 3600 if hours and self.run_started else 0.0
 
-    def budget_exceeded(self) -> str | None:
-        """Why this run has to stop now, or None.
+    def budget_spent(self) -> str | None:
+        """Why this run is over its budget, or None — without asking where the phase has got to.
 
         The budget is per `run`: the usage guard only keeps the subscription happy, and without a
         ceiling a long roadmap can keep starting sessions for days. Resuming grants a new budget,
@@ -713,6 +731,25 @@ class Orchestrator:
         cap = int(self.cfg.get("max_sessions") or 0)
         if cap and self.sessions_this_run >= cap:
             return f"--max-sessions {cap} reached"
+        return None
+
+    def budget_exceeded(self) -> str | None:
+        """Why this run has to stop where it stands, mid-step if need be.
+
+        The hour ceiling alone no longer does. It used to interrupt whatever was running: in the run
+        this was written for it killed an opus review 95 seconds after that review started, paid for
+        it, threw it away, and left the phase half-built for the morning. A phase in flight now gets
+        `BUDGET_GRACE_S` to finish, and `run` stops the run at the next phase boundary anyway. The
+        session cap is different — it counts steps, and the boundary between two steps is exactly
+        where it belongs."""
+        cap = int(self.cfg.get("max_sessions") or 0)
+        if cap and self.sessions_this_run >= cap:
+            return f"--max-sessions {cap} reached"
+        deadline = self.budget_deadline()
+        if deadline and time.time() >= deadline + BUDGET_GRACE_S:
+            return (f"--max-hours {float(self.cfg['max_hours']):g} reached "
+                    f"({(time.time() - self.run_started) / 3600:.1f} h in this run), and the phase in "
+                    f"flight did not finish inside the {BUDGET_GRACE_S // 3600} h grace")
         return None
 
     # ---- claude sessions -------------------------------------------------------
@@ -762,9 +799,26 @@ class Orchestrator:
         """Write the resume handle to state.json while the session is still running.
 
         It used to live in memory until the next save, so a SIGKILL or a power cut in the middle of a
-        long session lost the handle and the step started again from nothing."""
-        self.state["active_session"] = {"label": label, "session_id": session_id}
+        long session lost the handle and the step started again from nothing. The step and phase are
+        written with it because a label can change between the interrupt and the restart — a review
+        interrupted as `p04-review1` came back as `p04-review2`, which matched nothing, so 95 seconds
+        of an opus review were paid for and thrown away."""
+        self.state["active_session"] = {"label": label, "session_id": session_id,
+                                        "step": self.state.get("step"),
+                                        "phase_index": self.state.get("phase_index")}
         self.save()
+
+    def resume_handle(self, label: str) -> str:
+        """The session this step was working in when the run was interrupted, if there was one."""
+        act = self.state.get("active_session") or {}
+        if not act.get("session_id"):
+            return ""
+        if act.get("label") == label:
+            return act["session_id"]
+        if act.get("step") == self.state.get("step") and act.get("phase_index") == self.state.get("phase_index"):
+            log(f"{label}: resuming the session interrupted as {act['label']}")
+            return act["session_id"]
+        return ""
 
     def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=(), context_limit=0):
         cfg, st = self.cfg, self.state
@@ -773,7 +827,7 @@ class Orchestrator:
         cmd = self.session_command(prompt, model, schema, resume, extra_disallowed)
 
         out = {"session_id": resume, "result": None, "interrupted": None, "rejected": False,
-               "exit": None, "budget": "", "context": 0}
+               "exit": None, "budget": "", "context": 0, "stderr": ""}
         started = time.time()
         log(f"▶ {label} [{model}]" + (f" resume {resume[:8]}" if resume else ""))
         with open(f"{base}.jsonl", "a", encoding="utf-8") as jf, open(f"{base}.stderr.log", "a") as ef:
@@ -842,6 +896,11 @@ class Orchestrator:
             out["exit"] = proc.returncode
             self.child = None
 
+        if out["result"] is None and not out["session_id"]:
+            try:                            # nothing came back on stdout: stderr is all there is
+                out["stderr"] = Path(f"{base}.stderr.log").read_text(errors="ignore")[-4000:]
+            except OSError:
+                pass
         res = out["result"] or {}
         if res.get("is_error") and re.search(r"usage limit|rate limit|limit reached|resets? at",
                                              str(res.get("result", "")), re.I):
@@ -897,10 +956,10 @@ class Orchestrator:
                   "(if structured output is unavailable, end your final message with one ```json block):\n"
                   f"```json\n{json.dumps(schema, indent=1)}\n```\n")
         resume, cur, nudges, total_secs, total_cost = None, prompt, 0, 0, 0.0
-        rejections, corrections, handing_over = 0, 0, False
-        act = self.state.get("active_session")
-        if act and act.get("label") == label and act.get("session_id"):
-            resume, cur = act["session_id"], RESUME_AFTER_RESTART
+        rejections, corrections, starts, handing_over = 0, 0, 0, False
+        handle = self.resume_handle(label)
+        if handle:
+            resume, cur = handle, RESUME_AFTER_RESTART
         while True:
             self.check_stop()
             self.wait_for_usage()
@@ -963,6 +1022,25 @@ class Orchestrator:
                 log(f"{label}: no structured output (exit {out['exit']}) — nudging session ({nudges}/2)")
                 resume, cur = out["session_id"], NUDGE
                 continue
+            if not out["session_id"] and out["result"] is None:
+                # the session never started, so there is nothing to resume and nothing was spent:
+                # whatever broke (a corrupted config, a half-written install) is worth waiting out
+                why = next((w for pattern, w in STARTUP_FAILURES if pattern.search(out["stderr"])), "")
+                starts += 1
+                if starts < STARTUP_TRIES:
+                    wait = STARTUP_BACKOFF_S[min(starts, len(STARTUP_BACKOFF_S)) - 1]
+                    log(f"WARN {label}: the session did not start (exit {out['exit']})"
+                        + (f" — {why}" if why else "") + f"; trying again in {wait}s ({starts}/{STARTUP_TRIES})")
+                    self.event(label, "did not start", one_line(why or out["stderr"], 200))
+                    self.sleep_with_stop(wait)
+                    resume, cur = None, prompt
+                    continue
+                self.state["active_session"] = None
+                self.note_warning(f"{label}: the session did not start {starts} times"
+                                  + (f" — {why}" if why else ""))
+                raise StepFailed(f"{label}: the session did not start after {starts} tries (exit "
+                                 f"{out['exit']})" + (f": {why}" if why else "")
+                                 + f" — stderr: {one_line(out['stderr'], 300)}")
             self.state["active_session"] = None
             tail = one_line((out["result"] or {}).get("result", ""), 400)
             raise StepFailed(f"{label}: session ended without a usable result (exit {out['exit']}): {tail}")
@@ -991,13 +1069,18 @@ class Orchestrator:
                 raise StopRequested(f"{reason}, and waiting until ≈{hm(wake)} would run past "
                                     f"--max-hours {float(self.cfg['max_hours']):g} — stopping instead of sleeping")
             self.state["status"], self.state["resume_at"] = "paused_limit", hm(wake)
+            slept_from = time.time()
             if not paused:
                 self.event("usage", "paused", f"{reason}; sleeping until ≈{hm(wake)}")
                 self.notify(f"autodev ⏸ {reason}; resume ≈{hm(wake)}")
                 paused = True
             else:
                 self.save()
-            self.sleep_with_stop(wake - time.time())
+            try:
+                self.sleep_with_stop(wake - time.time())
+            finally:
+                self.state["totals"]["paused"] = round(
+                    self.state["totals"].get("paused", 0) + time.time() - slept_from)
             self.guard.forget_event_values()
 
     # ---- tests & git -------------------------------------------------------------
@@ -1891,6 +1974,9 @@ class Orchestrator:
             log(f"autodev run — spec {st['spec']} · branch {st['branch']} · step {st['step']}")
             while True:
                 self.check_stop()
+                spent = st["step"] in BOUNDARY_STEPS and self.budget_spent()
+                if spent:
+                    raise StopRequested(f"{spent} — stopped at the phase boundary")
                 if st["step"] == "architect":
                     self.step_architect()
                 elif st["step"] == "roadmap":
@@ -1934,6 +2020,21 @@ class Orchestrator:
                 pass
 
     # ---- progress document ------------------------------------------------------
+    def clock_line(self) -> str:
+        """Where the night actually went: working, waiting for the limit, or nobody running it.
+
+        A first full run took 17.4 hours of wall clock for 9.6 hours of agent time, and none of the
+        difference was visible in this document — five hours of usage pauses and two and a half
+        waiting for a human to restart it read the same as time spent building."""
+        wall = self.wall_clock()
+        tot = self.state["totals"]
+        if not wall:
+            return f"{tot['seconds'] / 3600:.1f} h working"
+        paused = float(tot.get("paused") or 0)
+        stopped = max(wall - tot["seconds"] - paused, 0)
+        return (f"{wall / 3600:.1f} h since the run was created · {tot['seconds'] / 3600:.1f} h working · "
+                f"{paused / 3600:.1f} h paused on the usage limit · {stopped / 3600:.1f} h not running")
+
     def render_progress(self) -> None:
         st = self.state
         phases = st.get("phases") or []
@@ -1954,6 +2055,7 @@ class Orchestrator:
                  f"- **Usage:** {self.guard.describe()}",
                  f"- **Totals:** {tot['sessions']} sessions · {tot['seconds'] / 3600:.1f} h agent time · "
                  f"≈${tot['cost_usd']:.2f} API-equivalent",
+                 f"- **Clock:** {self.clock_line()}",
                  f"- **Updated:** {ts()}", ""]
         if st.get("error"):
             lines += [f"> ❌ **Failed:** {one_line(st['error'], 500)}", ""]
@@ -2039,7 +2141,8 @@ def new_state(spec: str, cfg: dict) -> dict:
     return {"version": 1, "spec": spec, "created": ts(), "status": "running", "branch": None, "config": cfg,
             "run_id": secrets.token_hex(16),
             "project": {}, "phases": [], "phase_index": 0, "step": "architect", "phase_ctx": {}, "events": [],
-            "session_counter": 0, "active_session": None, "totals": {"sessions": 0, "seconds": 0, "cost_usd": 0.0}}
+            "session_counter": 0, "active_session": None,
+            "totals": {"sessions": 0, "seconds": 0, "cost_usd": 0.0, "paused": 0}}
 
 
 def cli_overrides(args) -> dict:

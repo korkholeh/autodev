@@ -237,11 +237,29 @@ one is based on, which would turn the rest of the stack into conflicts against h
 waits, so a long roadmap can keep starting sessions for days. `--max-hours H` and `--max-sessions N` stop the run
 instead — the branch, `PROGRESS.md` and the commits are all there, the reason is written into both, and the same
 `run` command continues from where it stopped (with a fresh budget, which is the point: spending more is your
-decision). The hour ceiling reaches into a running session: it is interrupted the same way a usage limit
-interrupts it, and the resume handle is on disk, so continuing picks the step up rather than restarting it.
-`--max-sessions` counts steps — one step is one session, however many times it had to resume. A usage pause that
-would end after the deadline does not happen at all: the run stops rather than sleeping into a morning nobody
-asked for.
+decision). **The hour ceiling stops the run at a phase boundary, not wherever the clock happened to fall.** It
+used to interrupt whatever was running: in one run it killed an opus review 95 seconds after that review started,
+paid for it, threw the work away, and left the phase half-built for the morning. A phase already under way now
+gets an hour of grace to finish, and the run stops before the next phase starts; only if the phase is still going
+after that grace is the session interrupted, with its resume handle on disk so continuing picks the step up rather
+than restarting it. `--max-sessions` counts steps — one step is one session, however many times it had to resume —
+and stops between two of them, which is exactly where it belongs. A usage pause that would end after the deadline
+does not happen at all: the run stops rather than sleeping into a morning nobody asked for.
+
+**The resume handle survives the step being renamed.** It is stored with the step and phase it belongs to, not
+only with the label of the moment: a review interrupted as `p04-review1` and restarted as `p04-review2` used to
+match nothing and start from scratch.
+
+**A session that never started is retried, not counted against the step.** Claude Code can fail before it has a
+session at all — a corrupted `~/.claude.json` failed a whole overnight run at 22:44, and the error message it
+printed was not even kept. There is nothing to resume and nothing was spent, so the orchestrator starts it again
+up to three times (20s, then 90s apart), names the cause when it recognises it, and if it still will not start
+fails the step with what the machine actually said on stderr.
+
+**`PROGRESS.md` says where the night went.** A first full run took 17.4 hours of wall clock for 9.6 hours of agent
+time and none of the difference was visible: five hours of usage pauses and two and a half waiting for a human to
+restart it read exactly like time spent building. The **Clock** line now separates the four: time since the run
+was created, time working, time paused on the usage limit, and time nobody was running it at all.
 
 Before every session, and every 5 minutes during one, the script reads the 5h/7d utilization. At ≥85% it sends
 SIGINT to the current session, sleeps until the reset (+2 min), then `--resume`s the same session. Sources: the
