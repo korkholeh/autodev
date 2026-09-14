@@ -64,7 +64,8 @@ This is the last human input of the run. Everything unasked becomes a logged gue
   ask which account to use (or "local only"). A `FAIL` on push permission or a missing token must be fixed now
   (`gh auth login` for that account). Useful extras: `--pr` (a draft PR per phase, stacked, each based on the one below it, plus one for the
   whole run carrying the live PROGRESS.md, and one on top for the closing docs/handoff commits — `--pr single`
-  opens only the run's own), `--push end|never`,
+  opens only the run's own; the chain is registered as a GitHub stack when the `gh-stack` extension is
+  installed — the doctor reports it), `--push end|never`,
   `--gh-repo owner/name` when there is no GitHub remote, `--git-email` to override the noreply address.
 - **`--merge-phases` only if the user asks for it in so many words.** It merges each phase into the base branch
   overnight, with nobody having read the diff. Never offer it as a default or add it to be helpful; if the user

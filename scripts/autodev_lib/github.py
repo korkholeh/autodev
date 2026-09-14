@@ -31,6 +31,11 @@ class GitHub:
             env["GH_TOKEN"] = self.token
         else:
             env["GH_HOST"], env["GH_ENTERPRISE_TOKEN"] = self.host, self.token
+        if self.repo:
+            # Commands that take no --repo (the gh-stack extension) resolve the repository from a
+            # git remote, and a run driven by --gh-repo may not have one. This says it outright
+            # instead, and is ignored by every call that passes --repo explicitly.
+            env["GH_REPO"] = self.repo
         return env
 
     def gh(self, *args, check=True) -> str:
@@ -120,6 +125,45 @@ class GitHub:
             return ""
         self.push(base, src=base)
         return base
+
+    @staticmethod
+    def pr_number(url: str) -> str:
+        return url.rstrip("/").rsplit("/", 1)[-1]
+
+    def stack(self, *args) -> tuple:
+        """Run a gh-stack command. Returns (ok, detail); ok is False when it could not run at all."""
+        try:
+            r = subprocess.run(["gh", "stack", *args], capture_output=True, text=True,
+                               env=self._env(), timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, one_line(e, 200)
+        out = one_line(r.stderr or r.stdout, 300)
+        if r.returncode != 0 and ("unknown command" in out or "extension" in out.lower()):
+            return False, "gh-stack not installed (gh extension install github/gh-stack)"
+        return r.returncode == 0, out
+
+    def link_stack(self, base: str, urls: list) -> tuple:
+        """Register pull requests that already exist as a stack on GitHub.
+
+        `gh stack link` is the entry point GitHub documents for branches managed by something other
+        than gh-stack itself, which is exactly autodev's case: the branches and the pull requests
+        are already there and correctly chained, and all that is missing is GitHub being told they
+        belong together. It is idempotent -- re-linking the same chain reports it already up to
+        date -- so the full list can be handed over again every time the stack grows."""
+        if len(urls) < 2:
+            return True, ""                     # one pull request is not a stack
+        return self.stack("link", "--base", base, *(self.pr_number(u) for u in urls))
+
+    def merge_stack(self, url: str, method: str = "merge") -> tuple:
+        """Merge the stack up to and including this pull request, atomically.
+
+        GitHub merges every member below it in one all-or-nothing operation and keeps the bases in
+        order itself, so this replaces both the one-by-one loop and the retargeting it needed."""
+        return self.stack("merge", "--yes", f"--{method}", self.pr_number(url))
+
+    def ready(self, url: str) -> None:
+        """Take a pull request out of draft; a draft cannot be merged, by hand or in a stack."""
+        self.gh("pr", "ready", url, "--repo", self.repo, check=False)
 
     def merge(self, url: str, base: str = "", method: str = "merge") -> str:
         """Take a draft pull request out of draft and merge it. Returns "" when it was merged.

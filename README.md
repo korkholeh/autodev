@@ -138,7 +138,8 @@ the next attempt happens after the next phase.
 ### Stacked pull requests
 
 A night's work in one pull request is not reviewable, so `--pr` opens one per phase instead — each based on the
-phase below it, the way a stacked-diff workflow does by hand:
+phase below it, and registered with GitHub as a real [stacked pull
+request](https://github.blog/changelog/2026-07-30-stacked-pull-requests-are-now-in-public-preview/):
 
 ```
 main
@@ -162,6 +163,19 @@ they arrive inside the first phase's pull request; the documentation, changelog 
 the last phase, so they get one of their own on top of the stack. Merge the stack bottom-up and nothing is left
 behind.
 
+Chaining the bases is what makes the stack reviewable; registering it is what makes GitHub *show* it as one — a
+stack map on every pull request, navigation between them, and an atomic merge. autodev creates the branches and
+the pull requests itself and then hands the chain to `gh stack link`, the entry point GitHub documents for
+branches managed outside its own extension. It is idempotent, so the whole chain is re-submitted each time it
+grows. That needs the extension:
+
+```
+gh extension install github/gh-stack
+```
+
+Without it nothing breaks: the pull requests are still chained and still merge bottom-up, GitHub simply does not
+know they are one stack. The run warns once and carries on, and `doctor --pr` says so before launch.
+
 The run's own pull request stays as the umbrella: it carries the live `PROGRESS.md` and the map of the chain,
 marking what has already landed, and it is the one to merge if the whole night is taken as a unit.
 
@@ -177,12 +191,19 @@ base as each one lands:
 gh pr ready 1  && gh pr merge 1 --merge      # --merge, not --squash/--rebase: see below
 ```
 
-`--merge-phases` hands that decision to the run instead: each phase's pull request is merged into the base as the
-phase lands, oldest first, and the closing one last. It is off by default because it writes to the base branch
-unattended, with nobody having read the diff. A refusal — branch protection, a required check — stops the chain
-there rather than skipping ahead, is logged, and is retried after the next phase; the run keeps building either
-way. Merges are always real merge commits: squash and rebase rewrite the commits that every pull request above
-this one is based on, which would turn the rest of the stack into conflicts against history that no longer exists.
+`--merge-phases` hands that decision to the run instead: everything finished is merged into the base as each
+phase lands, oldest first, the closing one last. It is off by default because it writes to the base branch
+unattended, with nobody having read the diff.
+
+With the stack registered, that is one `gh stack merge` — GitHub merges every member up to the newest in a single
+all-or-nothing operation and keeps the bases in order itself. Without the extension autodev falls back to merging
+them one at a time, naming the base explicitly each time: merging a pull request is supposed to retarget the ones
+stacked on it, but that is GitHub's bookkeeping racing the next merge, and a base that has not caught up merges a
+phase into the phase below it rather than failing. Either way a refusal — branch protection, a required check —
+stops there rather than skipping ahead, is logged, and is retried after the next phase; the run keeps building.
+
+Merges are always real merge commits: squash and rebase rewrite the commits that every pull request above this
+one is based on, which would turn the rest of the stack into conflicts against history that no longer exists.
 
 ## Control
 

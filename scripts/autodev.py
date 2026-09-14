@@ -1169,6 +1169,38 @@ class Orchestrator:
                 self.event(f"p{i + 1:02d}-pr", "draft", url)
             below, below_url, below_sha = branch, url or below_url, ph["commit"]
         self.publish_tail(below, below_url, below_sha)
+        self.link_stack()
+
+    def stack_urls(self) -> list:
+        """Every pull request in the chain, bottom to top."""
+        urls = [ph["pr_url"] for ph in self.state.get("phases") or [] if ph.get("pr_url")]
+        tail = self.state.get("tail_pr") or {}
+        return urls + ([tail["pr_url"]] if tail.get("pr_url") else [])
+
+    def link_stack(self) -> None:
+        """Tell GitHub the chain is a stack, not just pull requests that happen to be chained.
+
+        Basing each pull request on the one below it is what makes a stack reviewable; registering
+        it is what makes GitHub show it as one — the stack map on every pull request, navigation
+        between them, and the atomic merge. `gh stack link` is the documented entry point for
+        branches managed outside gh-stack, and it is idempotent, so the whole chain is handed over
+        again each time it grows.
+
+        The extension is optional. Without it the pull requests are still chained and still merge
+        bottom-up by hand; only GitHub's own view of them is missing, so this warns once and the
+        run carries on."""
+        st = self.state
+        urls = self.stack_urls()
+        if len(urls) < 2 or st.get("stack_linked") == urls:
+            return
+        ok, detail = self.github.link_stack(st.get("base_branch") or "", urls)
+        if ok:
+            st["stack_linked"] = urls
+            self.event("stack", "linked", f"{len(urls)} pull requests — {one_line(detail, 120)}")
+        elif not st.get("stack_warned"):
+            st["stack_warned"] = True
+            self.warn_run(f"GitHub stack not registered: {one_line(detail, 200)}. The pull requests "
+                          "are still chained and still merge bottom-up.")
 
     def publish_tail(self, below: str, below_url: str, below_sha: str) -> None:
         """The closing commits get a pull request of their own, on top of the stack.
@@ -1209,12 +1241,27 @@ class Orchestrator:
         is usually branch protection or a required check — the human's to resolve. The run logs it
         and carries on building rather than trying to find a way around it."""
         st = self.state
-        pending = [(f"p{i + 1:02d}", ph) for i, ph in enumerate(st.get("phases") or []) if ph.get("pr_url")]
+        items = [(f"p{i + 1:02d}", ph) for i, ph in enumerate(st.get("phases") or []) if ph.get("pr_url")]
         if (st.get("tail_pr") or {}).get("pr_url"):
-            pending.append(("finalize", st["tail_pr"]))
+            items.append(("finalize", st["tail_pr"]))
+        pending = [(label, item) for label, item in items if not item.get("merged")]
+        if not pending:
+            return
+        if st.get("stack_linked"):
+            # A registered stack merges as one all-or-nothing operation up to the chosen pull
+            # request, and GitHub keeps the bases in order itself. Retargeting them by hand here
+            # would be fighting the stack's own bookkeeping.
+            for _, item in pending:
+                self.github.ready(item["pr_url"])
+            ok, detail = self.github.merge_stack(pending[-1][1]["pr_url"])
+            if not ok:
+                self.event("stack-merge", "refused", detail)
+                return
+            for _, item in pending:
+                item["merged"] = True
+            self.event("stack-merge", "done", f"{len(pending)} pull request(s) into {st.get('base_branch')}")
+            return
         for label, item in pending:
-            if item.get("merged"):
-                continue
             problem = self.github.merge(item["pr_url"], base=st.get("base_branch") or "")
             if problem:
                 self.event(f"{label}-merge", "refused", problem)
@@ -1924,6 +1971,13 @@ def cmd_doctor(args) -> int:
                         f"gh: PR base branch {base} is on {repo}" if on_remote else
                         f"gh: PR base branch {base} is not on {repo} yet — the run pushes it before "
                         "the run branch, so the draft PR has a base to open against")
+                if getattr(args, "pr", False):
+                    ok, _ = gh.stack("--version")
+                    rep("OK" if ok else "INFO",
+                        "gh-stack: found — the phase PRs are registered as a GitHub stack" if ok else
+                        "gh-stack not installed (gh extension install github/gh-stack) — the phase "
+                        "PRs are still chained and still merge bottom-up, but GitHub will not show "
+                        "them as one stack")
         except RuntimeError as e:
             rep("FAIL", f"gh: {e}")
     elif shutil.which("gh"):

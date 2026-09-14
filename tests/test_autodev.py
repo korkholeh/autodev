@@ -1486,6 +1486,13 @@ class StackedPullRequests(TempCwd):
             o.prs.append({"head": head, "base": base_, "title": title, "body": body})
             return f"https://x/pull/{len(o.prs)}"
         gh.sync_pr = sync_pr
+        o.linked = []                           # nothing in this file may reach gh-stack for real
+
+        def link_stack(base_, urls):
+            o.linked.append((base_, list(urls)))
+            return o.link_result
+        o.link_result = (True, "created")
+        gh.link_stack = link_stack
         Path(".autodev").mkdir(exist_ok=True)
         return o
 
@@ -1618,19 +1625,94 @@ class StackedPullRequests(TempCwd):
         o.publish_stack()
         self.assertNotIn("autodev/spec-1-finalize", [pr["head"] for pr in o.prs])
 
+    # --- registering the chain as a GitHub stack --------------------------
+
+    def test_the_chain_is_registered_as_a_stack_bottom_to_top(self):
+        o = self.orch([self.phase(1), self.phase(2), self.phase(3)])
+        o.publish_stack()
+        self.assertEqual(o.linked, [("main", ["https://x/pull/1", "https://x/pull/2",
+                                              "https://x/pull/3"])])
+
+    def test_one_pull_request_is_not_a_stack(self):
+        o = self.orch([self.phase(1)])
+        o.publish_stack()
+        self.assertEqual(o.linked, [])
+
+    def test_the_stack_is_re_registered_only_when_it_grows(self):
+        phases = [self.phase(1), self.phase(2)]
+        o = self.orch(phases)
+        o.publish_stack()
+        o.publish_stack()                       # nothing new — no second call
+        self.assertEqual(len(o.linked), 1)
+        phases.append(self.phase(3))
+        o.publish_stack()
+        self.assertEqual(len(o.linked), 2)
+        self.assertEqual(len(o.linked[-1][1]), 3)
+
+    def test_the_closing_pull_request_joins_the_stack(self):
+        o = self.finalized([self.phase(1), self.phase(2)])
+        o.publish_stack()
+        self.assertEqual(o.linked[-1][1][-1], o.state["tail_pr"]["pr_url"])
+
+    def test_without_the_extension_the_run_warns_once_and_carries_on(self):
+        o = self.orch([self.phase(1), self.phase(2)])
+        o.link_result = (False, "gh-stack not installed")
+        o.publish_stack()
+        self.assertIsNone(o.state.get("stack_linked"))
+        self.assertEqual(len(o.state.get("run_warnings") or []), 1)
+        o.state["phases"].append(self.phase(3))
+        o.publish_stack()
+        self.assertEqual(len(o.state["run_warnings"]), 1)      # not once per phase
+
     # --- merging as the phases land ---------------------------------------
 
-    def merging(self, phases, refuse=()):
-        o = self.orch(phases)
-        o.merged = []
+    def merging(self, phases, refuse=(), linked=False, orch=None):
+        """`linked` picks the path: GitHub's own atomic stack merge, or one pull request at a time
+        when the gh-stack extension is not there to register a stack in the first place."""
+        o = orch or self.orch(phases)
+        o.merged, o.stack_merged, o.readied = [], [], []
+        o.link_result = (True, "created") if linked else (False, "gh-stack not installed")
 
         def merge(url, base="", method="merge"):
             if url in refuse:
                 return "required status check is pending"
             o.merged.append((url, base))
             return ""
+
+        def merge_stack(url, method="merge"):
+            if url in refuse:
+                return False, "required status check is pending"
+            o.stack_merged.append(url)
+            return True, ""
         o.github.merge = merge
+        o.github.merge_stack = merge_stack
+        o.github.ready = lambda url: o.readied.append(url)
         return o
+
+    def test_a_registered_stack_merges_atomically_up_to_the_newest(self):
+        """GitHub merges every member below it all-or-nothing and keeps the bases in order itself,
+        so autodev asks once instead of retargeting and merging one at a time."""
+        o = self.merging([self.phase(1), self.phase(2), self.phase(3)], linked=True)
+        o.publish_stack()
+        o.merge_stack()
+        self.assertEqual(o.stack_merged, ["https://x/pull/3"])
+        self.assertEqual(o.merged, [])                       # never the one-by-one path
+        self.assertEqual(len(o.readied), 3)                  # a draft cannot be merged
+
+    def test_a_registered_stack_marks_them_all_merged(self):
+        o = self.merging([self.phase(1), self.phase(2)], linked=True)
+        o.publish_stack()
+        o.merge_stack()
+        self.assertTrue(all(ph.get("merged") for ph in o.state["phases"]))
+        o.stack_merged.clear()
+        o.merge_stack()
+        self.assertEqual(o.stack_merged, [])                 # nothing left pending
+
+    def test_a_refused_stack_merge_leaves_everything_unmerged(self):
+        o = self.merging([self.phase(1), self.phase(2)], linked=True, refuse=("https://x/pull/2",))
+        o.publish_stack()
+        o.merge_stack()
+        self.assertFalse(any(ph.get("merged") for ph in o.state["phases"]))
 
     def test_each_merge_names_the_base_it_must_land_in(self):
         """GitHub retargets the rest of the stack when the one below it merges, but that is its
@@ -1673,12 +1755,10 @@ class StackedPullRequests(TempCwd):
         self.assertEqual([u for u, _ in o.merged], ["https://x/pull/1"])
 
     def test_the_closing_pull_request_merges_last(self):
-        o = self.finalized([self.phase(1)])
-        o.merged = []
-        o.github.merge = lambda url, base="", method="merge": o.merged.append(url) or ""
+        o = self.merging(None, orch=self.finalized([self.phase(1), self.phase(2)]))
         o.publish_stack()
         o.merge_stack()
-        self.assertEqual(o.merged[-1], o.state["tail_pr"]["pr_url"])
+        self.assertEqual([u for u, _ in o.merged][-1], o.state["tail_pr"]["pr_url"])
 
     def test_merging_is_off_unless_asked_for(self):
         self.assertIs(autodev.DEFAULTS["merge_phases"], False)
