@@ -1,5 +1,8 @@
 # autodev — autonomous development from a spec
 
+**An agent harness, shipped as a Claude Code skill.** The skill is the entry point (`/autodev`); the work is done
+by the orchestrator in `scripts/autodev.py`, which runs every step as a separate headless session.
+
 A technology-neutral pipeline: architecture → phases → for each phase plan → implementation → tests → review →
 end-to-end (e2e) QA → documentation → commit. Every step is a separate headless Claude Code session with a clean
 context. Works for native Swift apps (macOS, iOS), Rust TUIs, Django+React, FastAPI+React, Django+htmx, and any
