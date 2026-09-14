@@ -3,7 +3,7 @@ Step: DOCUMENTATION — phase {{n}}/{{total}}: "{{title}}"
 The phase is built, tested and reviewed. Make the documentation true again before it is committed.
 
 Read: `{{phase_dir}}/PLAN.md`, this phase's diff (`git diff {{base_sha}}`), `.autodev/ARCHITECTURE.md`,
-`.autodev/DECISIONS.md`, and the current `CLAUDE.md`, `docs/dev/`, `docs/user/`.
+this phase's decisions (`{{decisions_tail}}`), and the current `CLAUDE.md`, `docs/dev/`, `docs/user/`.
 
 Guides: `.autodev/guides/write-project-docs.md` for anything a developer reads,
 `.autodev/guides/user-docs.md` for anything a user reads.

@@ -321,6 +321,15 @@ read-only, sees that diff and the review it answered, and asks three questions: 
 fixed in the product and covered by a test, did the fixes break anything else, and was any rejected finding argued
 in `DECISIONS.md`. It approves, or the phase gets one more fix pass and lands with a warning naming the audit file.
 
+**The decision log is read in slices.** `DECISIONS.md` is the one file that grows all night — 164 KB and 216
+entries by the end of that run — and every plan, implementation and review was told to read it whole, which by the
+last phase was tens of thousands of tokens of fixed tax per session. The sessions' own headings did not help: 23 of
+them in four different shapes, one phase's section sitting above the architect's. The orchestrator now writes one
+`## <step>` section per step in run order (and takes the heading back off again if the step decided nothing), so
+`grep -n '^## '` is an index. Each phase prompt hands the session the exact slice it needs — `sed -n '/^## p03-/,$p'`
+for phase 4 — and tells it to grep the older entries by topic instead of reading them. Only `finalize` still reads
+the whole log, which is its job: the morning briefing lists the decisions a human might overrule.
+
 **A green suite that ran nothing is a warning.** The summary in `PROGRESS.md` used to be the last line of the test
 output, and the last line of `cargo test` is a doc-test block that always reads `0 passed; 0 failed` — every phase of
 a run was recorded as having verified nothing. The runner's own summary lines are read instead (cargo, pytest,

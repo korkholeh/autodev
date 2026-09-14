@@ -3,7 +3,8 @@ Step: PLAN — phase {{n}}/{{total}}: "{{title}}"
 Context:
 - Spec: `{{spec}}` · Architecture: `.autodev/ARCHITECTURE.md` · Risks: `.autodev/RISKS.md`
 - Roadmap (all phases; this is #{{n}}): `.autodev/ROADMAP.md`
-- Decisions so far: `.autodev/DECISIONS.md` · Progress: `.autodev/PROGRESS.md`
+- Decisions so far (this phase and the one before it): `{{decisions_tail}}` — grep the older entries by topic
+  rather than reading the whole file · Progress: `.autodev/PROGRESS.md`
 - Conventions: `CLAUDE.md` · Stack commands: `.autodev/PROFILE.md`
 - Plans of earlier phases: `.autodev/phases/*/PLAN.md` (skim only what's relevant)
 

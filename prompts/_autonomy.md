@@ -7,8 +7,10 @@ Rules:
 1. Never ask questions, never wait for confirmation, never present options and stop.
 2. When you face a choice (library, naming, ambiguous requirement, UX detail, trade-off): take the option you would
    recommend. If none is clearly better, take the first reasonable one — the simplest that satisfies the spec — and continue.
-3. Append every non-trivial decision or assumption to `.autodev/DECISIONS.md`:
+3. Append every non-trivial decision or assumption to `.autodev/DECISIONS.md`, as one bullet at the end of the file:
    `- [<phase>/<step>] <decision> — why: <one line> — alternatives: <short list>`
+   Do not add headings of your own and do not read the whole file: the orchestrator opens a `## ` section per step,
+   and each step's prompt says which slice of it to read.
 4. Source of truth, in order: the spec → `.autodev/ARCHITECTURE.md` and the ADRs → existing code conventions →
    `CLAUDE.md` → `.autodev/PROFILE.md` → mainstream best practice for this stack.
 5. Stay inside the current step's scope. Don't implement later phases, don't rewrite the roadmap.

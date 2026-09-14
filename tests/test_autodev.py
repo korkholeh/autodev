@@ -672,6 +672,69 @@ class CommandFiles(TempCwd):
             self.assertIsNone(staging.COMMAND_FILES.search(name), name)
 
 
+class DecisionsLog(TempCwd):
+    """One section per step, written by the orchestrator, so a session can read a slice of it."""
+
+    def orch(self):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state["step"] = "implement"
+        Path(".autodev").mkdir(exist_ok=True)
+        o = autodev.Orchestrator(state)
+        o.notify = lambda msg: None
+        (autodev.AD / "DECISIONS.md").write_text("# Decisions\n\n")
+        return o
+
+    def text(self):
+        return (autodev.AD / "DECISIONS.md").read_text()
+
+    def test_a_step_that_decided_something_keeps_its_section(self):
+        o = self.orch()
+        o.decisions_open("p01-implement")
+        o.record_decision("picked ron over json for the world file")
+        o.decisions_close("p01-implement")
+        self.assertIn("## p01-implement", self.text())
+        self.assertIn("ron over json", self.text())
+
+    def test_a_step_that_decided_nothing_leaves_no_heading(self):
+        o = self.orch()
+        o.decisions_open("p01-docs")
+        o.decisions_close("p01-docs")
+        self.assertNotIn("##", self.text())
+
+    def test_resuming_the_same_step_does_not_open_a_second_section(self):
+        o = self.orch()
+        o.decisions_open("p01-implement")
+        o.record_decision("one")
+        o.decisions_open("p01-implement")
+        self.assertEqual(self.text().count("## p01-implement"), 1)
+
+    def test_the_sections_are_an_index_in_run_order(self):
+        o = self.orch()
+        for label in ("architect", "p01-plan", "p01-implement"):
+            o.decisions_open(label)
+            o.record_decision(f"something in {label}")
+            o.decisions_close(label)
+        self.assertEqual([ln for ln in self.text().splitlines() if ln.startswith("## ")],
+                         ["## architect", "## p01-plan", "## p01-implement"])
+
+    def test_a_log_nobody_can_afford_to_read_whole_is_a_warning(self):
+        o = self.orch()
+        (autodev.AD / "DECISIONS.md").write_text("# Decisions\n\n" + "- [x] filler\n" * 40000)
+        o.decisions_open("p07-implement")
+        self.assertTrue(any("DECISIONS.md is" in w for w in o.state.get("run_warnings", [])))
+
+    def test_a_phase_is_told_to_read_its_own_slice(self):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state.update(step="implement", phase_index=3, phases=[
+            {"title": f"P{k}", "slug": f"p{k}", "goal": "g", "deliverables": [], "acceptance_criteria": [],
+             "status": "pending"} for k in range(1, 5)])
+        Path(".autodev").mkdir(exist_ok=True)
+        o = autodev.Orchestrator(state)
+        self.assertIn("/^## p03-/,$p", autodev.PhaseRun(o, 3).common["decisions_tail"])
+        state["phase_index"] = 0
+        self.assertIn("/^## architect/,$p", autodev.PhaseRun(o, 0).common["decisions_tail"])
+
+
 class ResumeHandle(TempCwd):
     """The handle has to survive the step being called something slightly different."""
 

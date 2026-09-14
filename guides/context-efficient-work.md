@@ -13,7 +13,9 @@ Read to find the edit boundary, then stop. More context is not more correct.
    then the body only if you must change it.
 6. Stop collecting once you can name the files to edit and the checks to run. Then start.
 7. Trust what you already read in this session. Do not reopen an unchanged file without a new reason.
-8. Prefer the project's own docs (`CLAUDE.md`, `docs/dev/`, `.autodev/`) over re-deriving documented structure from source.
-9. Reach for external library docs only for unfamiliar or version-sensitive APIs — and check the pinned version first
+8. `.autodev/DECISIONS.md` is a whole run's log, newest last, one `## ` section per step. Read the slice your step
+   names, and grep the rest by topic — never read it top to bottom.
+9. Prefer the project's own docs (`CLAUDE.md`, `docs/dev/`, `.autodev/`) over re-deriving documented structure from source.
+10. Reach for external library docs only for unfamiliar or version-sensitive APIs — and check the pinned version first
    (lockfile, `Cargo.toml`, `package.json`, `Package.resolved`, `requirements*.txt`, `pyproject.toml`).
-10. Ask for one symbol or topic, not a library's whole documentation set.
+11. Ask for one symbol or topic, not a library's whole documentation set.

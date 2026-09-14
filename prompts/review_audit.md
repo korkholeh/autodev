@@ -8,7 +8,7 @@ What the fix session changed, and nothing else:
 
 What it was supposed to do:
 - The review it was answering: `{{phase_dir}}/{{review_file}}`
-- Plan: `{{phase_dir}}/PLAN.md` · Conventions: `CLAUDE.md` · Decisions: `.autodev/DECISIONS.md`
+- Plan: `{{phase_dir}}/PLAN.md` · Conventions: `CLAUDE.md` · Decisions for this phase: `{{decisions_tail}}`
 - Guide: `.autodev/guides/review-rubric.md` — the same severities as a full review
 
 Three questions, in this order:

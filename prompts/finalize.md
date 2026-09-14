@@ -3,7 +3,8 @@ Step: FINALIZE — all {{total}} phases are built, tested, reviewed and committe
 This is the last session of the run. A developer will read what you leave behind, in the morning, with no memory of
 any of it. Make the repository self-explanatory and tell the truth about its state.
 
-Read: `.autodev/ROADMAP.md`, `.autodev/PROGRESS.md`, `.autodev/DECISIONS.md`, `.autodev/RISKS.md`,
+Read: `.autodev/ROADMAP.md`, `.autodev/PROGRESS.md`, `.autodev/DECISIONS.md` (the whole log this time — but its
+`## ` sections are the index, and `grep -n '^- \[' ` gives you the entries without the reasoning), `.autodev/RISKS.md`,
 `.autodev/ARCHITECTURE.md`, every `.autodev/phases/*/PLAN.md` and `REVIEW-r*.md` (skim), the current `docs/` tree,
 and `git log --oneline {{base_sha}}..HEAD`.
 

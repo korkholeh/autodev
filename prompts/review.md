@@ -7,7 +7,8 @@ Guide for this step: `.autodev/guides/review-rubric.md` — it defines the order
 Inspect this phase's changes:
 - `git diff --stat {{base_sha}}` then `git diff {{base_sha}}` (new files are staged, so they appear in the diff)
 - Plan: `{{phase_dir}}/PLAN.md` · Spec: `{{spec}}` · Architecture: `.autodev/ARCHITECTURE.md` · Risks: `.autodev/RISKS.md`
-- Conventions: `CLAUDE.md` · Decisions: `.autodev/DECISIONS.md`
+- Conventions: `CLAUDE.md` · Decisions for this phase and the one before it: `{{decisions_tail}}` (grep the older
+  entries by topic; the file is a whole run's log)
 {{previous_review}}
 
 Phase goal: {{goal}}

@@ -1,6 +1,8 @@
 Step: IMPLEMENT — phase {{n}}/{{total}}: "{{title}}" (session {{run}})
 
-Read first: `{{phase_dir}}/PLAN.md`, `CLAUDE.md`, `.autodev/PROFILE.md`, `.autodev/DECISIONS.md`. Spec: `{{spec}}`.
+Read first: `{{phase_dir}}/PLAN.md`, `CLAUDE.md`, `.autodev/PROFILE.md`. Spec: `{{spec}}`.
+Decisions so far — this phase and the one before it: `{{decisions_tail}}`. The rest of that file is older context:
+grep it by topic when you touch one (`grep -n -i '<topic>' .autodev/DECISIONS.md`), do not read it whole.
 
 Guides for this step: `.autodev/guides/context-efficient-work.md` and `.autodev/guides/verify-change.md`.
 If something behaves unexpectedly, switch to `.autodev/guides/systematic-debugging.md` instead of guessing a patch.

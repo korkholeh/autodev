@@ -354,6 +354,8 @@ class PhaseRun:
             e2e_command=orch.e2e_command() or "(not created yet — build the harness)",
             e2e_up_command=proj.get("e2e_up_command") or "(nothing to start)",
             base_sha=self.ctx.get("base_sha", ""),
+            decisions_tail=(f"sed -n '/^## p{self.n - 1:02d}-/,$p' .autodev/DECISIONS.md" if self.n > 1
+                            else "sed -n '/^## architect/,$p' .autodev/DECISIONS.md"),
             user_facing="yes" if self.ph.get("user_facing", True) else "no")
 
 
@@ -462,6 +464,40 @@ class Orchestrator:
         if not any(w.endswith(line) for w in self.state.get("run_warnings", [])):
             self.warn_run(line)
 
+    DECISIONS_BIG_MB = 0.3          # the point where reading the whole file is a tax on every session
+
+    def decisions_open(self, title: str) -> None:
+        """Start this step's section, so the log has an index a session can read a slice of.
+
+        Sessions used to write their own headings: a run ended with 23 of them in four different
+        shapes, one phase's section sitting above the architect's, and no way to read "this phase
+        and the one before" out of 164 KB that every plan, implementation and review then read in
+        full."""
+        dec = AD / "DECISIONS.md"
+        try:
+            text = dec.read_text(encoding="utf-8") if dec.exists() else ""
+            if re.findall(r"^## .*$", text, re.M)[-1:] == [f"## {title}"]:
+                return                                  # resumed into the same step
+            with open(dec, "a", encoding="utf-8") as f:
+                f.write(f"\n## {title}\n\n")
+            size = dec.stat().st_size
+            if size > self.DECISIONS_BIG_MB * 1024 * 1024:
+                self.note_warning(f"DECISIONS.md is {size / 1024:.0f} KB — sessions are told to read a slice, "
+                                  "but anything that reads it whole is paying for all of it")
+        except OSError as e:
+            log(f"WARN could not open a DECISIONS.md section: {e}")
+
+    def decisions_close(self, title: str) -> None:
+        """Drop this step's heading again if the step decided nothing worth writing down."""
+        dec = AD / "DECISIONS.md"
+        try:
+            text = dec.read_text(encoding="utf-8") if dec.exists() else ""
+            empty = f"\n## {title}\n\n"
+            if text.endswith(empty):
+                atomic_write(dec, text[: -len(empty)] + "\n")
+        except OSError as e:
+            log(f"WARN could not tidy DECISIONS.md: {e}")
+
     def record_decision(self, line: str) -> None:
         """Append a line to DECISIONS.md the same way the sessions do, so a human reads one list."""
         try:
@@ -528,7 +564,9 @@ class Orchestrator:
         dec = AD / "DECISIONS.md"
         if not dec.exists():
             dec.write_text("# Decisions & assumptions (autonomous run)\n\n"
-                           "Appended by agents whenever they choose between options without a human.\n\n")
+                           "Appended by agents whenever they choose between options without a human.\n"
+                           "One `## ` section per step, oldest first — the orchestrator writes those headings,\n"
+                           "so `grep -n '^## '` is the index and a session can read only the part it needs.\n\n")
 
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -936,6 +974,7 @@ class Orchestrator:
         `context_limit` is for steps that can hand their work over — the ones that keep a checkpoint
         on disk, so a fresh session can pick it up from there and stop paying for the old one."""
         guides = self.guides_digest()
+        self.decisions_open(label)
         try:
             res = self._session(label, prompt, model, schema, required_key, extra_disallowed, recheck,
                                 context_limit)
@@ -944,6 +983,7 @@ class Orchestrator:
         finally:
             self.sessions_this_run += 1     # one step, however many resumes it took
             self.check_guides(label, guides)
+            self.decisions_close(label)
 
     def _session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None,
                  context_limit=0):
