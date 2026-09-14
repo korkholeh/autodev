@@ -1568,6 +1568,118 @@ class StackedPullRequests(TempCwd):
         o.publish_stack()
         self.assertTrue(o.prs[0]["title"].startswith("autodev 01/07:"), o.prs[0]["title"])
 
+    # --- the closing commits ---------------------------------------------
+
+    def finalized(self, phases):
+        """A real repository whose branch carries commits above the last phase's."""
+        for args in (["init", "-q", "-b", "main", "."], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "T"]):
+            subprocess.run(["git", *args], check=True, capture_output=True)
+        shas = []
+        for k in range(len(phases) + 2):        # one commit per phase, then finalize + run-finished
+            Path(f"f{k}.txt").write_text("x\n")
+            subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-qm", f"c{k}"], check=True, capture_output=True)
+            shas.append(subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                                       text=True).stdout.strip())
+        for ph, sha in zip(phases, shas):
+            ph["commit"] = sha
+        o = self.orch(phases)
+        o.state["finalized"] = True
+        return o
+
+    def test_the_closing_commits_get_a_pull_request_of_their_own(self):
+        """Regression: docs, changelog and handoff are committed after the last phase, so merging
+        the stack phase by phase left them behind in the run's pull request alone."""
+        o = self.finalized([self.phase(1), self.phase(2)])
+        o.publish_stack()
+        self.assertEqual(o.prs[-1]["head"], "autodev/spec-1-finalize")
+        self.assertEqual(o.prs[-1]["base"], "autodev/spec-1-p02-p2")
+        self.assertIn("handoff", o.prs[-1]["title"])
+
+    def test_the_closing_pull_request_is_opened_once(self):
+        o = self.finalized([self.phase(1)])
+        o.publish_stack()
+        o.prs.clear(), o.pushed.clear()
+        o.publish_stack()
+        self.assertEqual(o.prs, [])
+
+    def test_no_closing_pull_request_while_the_run_is_still_building(self):
+        o = self.finalized([self.phase(1)])
+        o.state["finalized"] = False
+        o.publish_stack()
+        self.assertNotIn("autodev/spec-1-finalize", [pr["head"] for pr in o.prs])
+
+    def test_nothing_above_the_last_phase_means_no_closing_pull_request(self):
+        """The last phase's commit is the tip: there is no tail to open anything for."""
+        o = self.finalized([self.phase(1), self.phase(2)])
+        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        o.state["phases"][-1]["commit"] = head
+        o.publish_stack()
+        self.assertNotIn("autodev/spec-1-finalize", [pr["head"] for pr in o.prs])
+
+    # --- merging as the phases land ---------------------------------------
+
+    def merging(self, phases, refuse=()):
+        o = self.orch(phases)
+        o.merged = []
+
+        def merge(url, method="merge"):
+            if url in refuse:
+                return "required status check is pending"
+            o.merged.append(url)
+            return ""
+        o.github.merge = merge
+        return o
+
+    def test_phases_merge_oldest_first(self):
+        o = self.merging([self.phase(1), self.phase(2), self.phase(3)])
+        o.publish_stack()
+        o.merge_stack()
+        self.assertEqual(o.merged, ["https://x/pull/1", "https://x/pull/2", "https://x/pull/3"])
+
+    def test_a_refusal_stops_the_chain_instead_of_skipping_ahead(self):
+        """#2 is based on branch #1. Merging #3 while #1 is unmerged asks GitHub to merge against
+        a base that never landed."""
+        o = self.merging([self.phase(1), self.phase(2), self.phase(3)], refuse=("https://x/pull/2",))
+        o.publish_stack()
+        o.merge_stack()
+        self.assertEqual(o.merged, ["https://x/pull/1"])
+
+    def test_a_merged_phase_is_not_merged_again(self):
+        o = self.merging([self.phase(1), self.phase(2)])
+        o.publish_stack()
+        o.merge_stack()
+        o.merged.clear()
+        o.merge_stack()
+        self.assertEqual(o.merged, [])
+
+    def test_a_refused_phase_is_retried_on_the_next_push(self):
+        o = self.merging([self.phase(1)], refuse=("https://x/pull/1",))
+        o.publish_stack()
+        o.merge_stack()
+        self.assertEqual(o.merged, [])
+        o.github.merge = lambda url, method="merge": o.merged.append(url) or ""
+        o.merge_stack()
+        self.assertEqual(o.merged, ["https://x/pull/1"])
+
+    def test_the_closing_pull_request_merges_last(self):
+        o = self.finalized([self.phase(1)])
+        o.merged = []
+        o.github.merge = lambda url, method="merge": o.merged.append(url) or ""
+        o.publish_stack()
+        o.merge_stack()
+        self.assertEqual(o.merged[-1], o.state["tail_pr"]["pr_url"])
+
+    def test_merging_is_off_unless_asked_for(self):
+        self.assertIs(autodev.DEFAULTS["merge_phases"], False)
+
+    def test_the_map_shows_what_already_landed(self):
+        o = self.merging([self.phase(1), self.phase(2)])
+        o.publish_stack()
+        o.merge_stack()
+        self.assertIn("1. https://x/pull/1 — Phase 1  ✅ merged", o.stack_map())
+
     def test_the_umbrella_lists_the_whole_chain(self):
         o = self.orch([self.phase(1), self.phase(2)])
         o.publish_stack()

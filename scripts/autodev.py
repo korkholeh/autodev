@@ -100,6 +100,7 @@ DEFAULTS = {
     "git_email": "",      # override commit email (default: <id>+<login>@users.noreply.github.com)
     "push": "auto",       # phase | end | never; auto = phase when gh_user is set, else never
     "pr": "",             # "" off · "stacked" a draft PR per phase + one for the run · "single" just the run's
+    "merge_phases": False,  # merge each phase's PR into the base as the phase lands (stacked only)
 }
 
 ARCH_SCHEMA = {
@@ -1147,12 +1148,12 @@ class Orchestrator:
         A phase that changed nothing has no commit to open a pull request for, so the next phase
         stacks on whatever was last published instead, and the chain stays unbroken."""
         st = self.state
-        below, below_url = st.get("base_branch"), ""
+        below, below_url, below_sha = st.get("base_branch"), "", ""
         for i, ph in enumerate(st.get("phases") or []):
             if ph.get("status") != "done" or not ph.get("commit"):
                 continue
             if ph.get("pr_branch"):                      # already published — just carry the chain on
-                below, below_url = ph["pr_branch"], ph.get("pr_url") or below_url
+                below, below_url, below_sha = ph["pr_branch"], ph.get("pr_url") or below_url, ph["commit"]
                 continue
             if not below or below == st["branch"]:
                 return
@@ -1166,19 +1167,77 @@ class Orchestrator:
             if url:
                 ph["pr_url"] = url
                 self.event(f"p{i + 1:02d}-pr", "draft", url)
-            below, below_url = branch, url or below_url
+            below, below_url, below_sha = branch, url or below_url, ph["commit"]
+        self.publish_tail(below, below_url, below_sha)
+
+    def publish_tail(self, below: str, below_url: str, below_sha: str) -> None:
+        """The closing commits get a pull request of their own, on top of the stack.
+
+        Documentation, the changelog and the handoff are committed after the last phase, so they
+        sit above every phase branch and belong to none of them. Without this they would reach the
+        base only through the run's own pull request — merge the stack phase by phase and they are
+        quietly left behind."""
+        st = self.state
+        tail = st.setdefault("tail_pr", {})
+        if not st.get("finalized") or tail.get("pr_branch") or not below_sha or below == st["branch"]:
+            return
+        head = git("rev-parse", "HEAD")
+        ahead = git("rev-list", "--count", f"{below_sha}..{head}", check=False)
+        if not (ahead.isdigit() and int(ahead) > 0):
+            return                                       # the last phase is the end of the branch
+        branch = f"{st['branch']}-finalize"
+        self.github.push(branch, src=head)
+        tail["pr_branch"], tail["commit"] = branch, head
+        self.event("finalize-push", "done", f"{self.github.repo}@{branch}")
+        body = [f"**Closing the run** — stacked on {below_url or f'`{below}`'}"
+                + (f" · run: {st['pr_url']}" if st.get("pr_url") else ""), "",
+                "Documentation made true against what was actually built, the changelog, and the "
+                "handoff notes. Committed after the last phase, so it belongs to none of them.", "",
+                "Read with `.autodev/HANDOFF.md` and `.autodev/PROGRESS.md`.", "",
+                "🤖 Written unattended by [autodev](https://github.com/korkholeh/autodev)."]
+        url = self.github.sync_pr(branch, below, "autodev: documentation, changelog and handoff",
+                                  "\n".join(body))
+        if url:
+            tail["pr_url"] = url
+            self.event("finalize-pr", "draft", url)
+
+    def merge_stack(self) -> None:
+        """Merge the finished phases into the base, oldest first, when the run is told to.
+
+        Strictly in order, and stopping at the first refusal: pull request N+1 is based on branch
+        N, so merging out of order asks GitHub to merge against a base that never landed. A refusal
+        is usually branch protection or a required check — the human's to resolve. The run logs it
+        and carries on building rather than trying to find a way around it."""
+        st = self.state
+        pending = [(f"p{i + 1:02d}", ph) for i, ph in enumerate(st.get("phases") or []) if ph.get("pr_url")]
+        if (st.get("tail_pr") or {}).get("pr_url"):
+            pending.append(("finalize", st["tail_pr"]))
+        for label, item in pending:
+            if item.get("merged"):
+                continue
+            problem = self.github.merge(item["pr_url"])
+            if problem:
+                self.event(f"{label}-merge", "refused", problem)
+                return
+            item["merged"] = True
+            self.event(f"{label}-merge", "done", item["pr_url"])
 
     def stack_map(self) -> str:
         """The chain, for the umbrella pull request — the one body that is rewritten every push."""
-        published = [(i + 1, ph) for i, ph in enumerate(self.state.get("phases") or []) if ph.get("pr_url")]
+        st = self.state
+        published = [(i + 1, ph) for i, ph in enumerate(st.get("phases") or []) if ph.get("pr_url")]
         if not published:
             return ""
-        total = len(self.state.get("phases") or [])
+        total = len(st.get("phases") or [])
         lines = ["", "## Review it phase by phase", "",
                  "Each phase is a draft pull request based on the one below it, so they read in order and "
                  f"merge bottom-up. This pull request carries all {len(published)} of {total} at once.", ""]
         for n, ph in published:
-            lines.append(f"{n}. {ph['pr_url']} — {ph['title']}")
+            lines.append(f"{n}. {ph['pr_url']} — {ph['title']}" + ("  ✅ merged" if ph.get("merged") else ""))
+        tail = st.get("tail_pr") or {}
+        if tail.get("pr_url"):
+            lines.append(f"{len(published) + 1}. {tail['pr_url']} — documentation, changelog and handoff"
+                         + ("  ✅ merged" if tail.get("merged") else ""))
         return "\n".join(lines + [""])
 
     def publish(self, final: bool = False) -> None:
@@ -1223,6 +1282,8 @@ class Orchestrator:
                     self.event("pr", "draft", url)
                 if self.pr_mode() == "stacked":
                     self.publish_stack()
+                    if cfg.get("merge_phases"):
+                        self.merge_stack()
                     now = self.stack_map()
                     if now != was:
                         umbrella(now)
@@ -1996,6 +2057,10 @@ def main() -> int:
     run.add_argument("--pr", nargs="?", const="stacked", choices=("stacked", "single"), default=None,
                      help="draft PRs: `stacked` (default) opens one per phase, each based on the phase "
                           "below it, plus one for the whole run; `single` opens only the run's own")
+    run.add_argument("--merge-phases", dest="merge_phases", action="store_const", const=True,
+                     help="merge each phase's PR into the base branch as the phase lands, oldest "
+                          "first (stacked PRs only). Off by default: this writes to the base branch "
+                          "unattended, with nobody having read the diff")
     run.set_defaults(func=cmd_run)
 
     doc = sub.add_parser("doctor", help="pre-flight checks")

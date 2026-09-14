@@ -110,6 +110,7 @@ from then on every session reads that file.
 | `--gh-user LOGIN` | token via `gh auth token --user LOGIN`; the active gh account is **not switched** |
 | `--push phase\|end\|never` | when to push the `autodev/…` branch (with `--gh-user`, after every phase by default) |
 | `--pr` | a draft PR per phase, stacked, plus one for the whole run (`--pr single` for only the run's). See [Stacked pull requests](#stacked-pull-requests) |
+| `--merge-phases` | merge each phase's PR into the base as the phase lands, oldest first. Off by default — it writes to the base branch unattended |
 | `--gh-repo owner/name` | repo, if the remote is not GitHub or there is none (`--remote` — a different remote name) |
 | `--git-name`, `--git-email` | override the author; by default the name from the profile + `ID+login@users.noreply.github.com` |
 | `--gh-host` | GitHub Enterprise (then `--git-email` is required) |
@@ -141,26 +142,47 @@ phase below it, the way a stacked-diff workflow does by hand:
 
 ```
 main
- ← #1  autodev 01/07: Skeleton & terminal loop     1 commit
+ ← #1  autodev 01/07: Skeleton & terminal loop     phase 1 + the run's setup commits
     ← #2  autodev 02/07: Config & preflight        1 commit
        ← #3  autodev 03/07: Map rendering          1 commit
+          ← #4  autodev: documentation, changelog and handoff
 
 main
- ← #4  autodev: mosslight            the whole run, body = PROGRESS.md
+ ← #5  autodev: mosslight            the whole run, body = PROGRESS.md + the map above
 ```
 
 Nothing is rebased and no branch is created locally. The run's history is already linear — one commit per phase —
 so a phase branch is just that phase's commit pushed under its own name, once, when the phase finishes. Its body
-is written from what the phase left behind: goal, deliverables, acceptance criteria, the last review verdict, and
-the phase's warnings. It never needs rewriting afterwards, because the commit cannot change.
+is written from what the phase left behind: the last review verdict and the phase's warnings first, then its
+deliverables and acceptance criteria folded away. It never needs rewriting afterwards, because the commit cannot
+change.
 
-The run's own pull request stays as the umbrella: it carries the live `PROGRESS.md` and the map of the chain, and
-it is the one to merge if the whole night is taken as a unit. Otherwise the phases merge bottom-up — GitHub
-retargets the rest of the stack onto the base as each one lands.
+Two ends of the run are not phases. The snapshot, architecture and roadmap commits are made before phase 1, so
+they arrive inside the first phase's pull request; the documentation, changelog and handoff are committed after
+the last phase, so they get one of their own on top of the stack. Merge the stack bottom-up and nothing is left
+behind.
+
+The run's own pull request stays as the umbrella: it carries the live `PROGRESS.md` and the map of the chain,
+marking what has already landed, and it is the one to merge if the whole night is taken as a unit.
 
 Read them in order and stop wherever the work stops being worth reading. A phase that changed nothing gets no
 pull request, and the phase after it stacks on the last one that exists. `--pr single` opens only the run's own
 pull request, as earlier versions did.
+
+**Merging.** autodev does not merge anything by default — it pushes and opens drafts, and the decision is yours.
+To merge by hand, take the bottom one out of draft and merge it; GitHub retargets the rest of the stack onto the
+base as each one lands:
+
+```
+gh pr ready 1  && gh pr merge 1 --merge      # --merge, not --squash/--rebase: see below
+```
+
+`--merge-phases` hands that decision to the run instead: each phase's pull request is merged into the base as the
+phase lands, oldest first, and the closing one last. It is off by default because it writes to the base branch
+unattended, with nobody having read the diff. A refusal — branch protection, a required check — stops the chain
+there rather than skipping ahead, is logged, and is retried after the next phase; the run keeps building either
+way. Merges are always real merge commits: squash and rebase rewrite the commits that every pull request above
+this one is based on, which would turn the rest of the stack into conflicts against history that no longer exists.
 
 ## Control
 

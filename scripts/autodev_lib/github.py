@@ -121,10 +121,28 @@ class GitHub:
         self.push(base, src=base)
         return base
 
+    def merge(self, url: str, method: str = "merge") -> str:
+        """Take a draft pull request out of draft and merge it. Returns "" when it was merged.
+
+        The method is a real merge commit on purpose. Squash and rebase rewrite the commits, and
+        every pull request stacked above this one is based on the commits as they are — rewriting
+        them turns the rest of the stack into conflicts against history that no longer exists."""
+        state = self.gh("pr", "view", url, "--repo", self.repo, "--json", "state,isDraft",
+                        "--jq", '"\(.state)\t\(.isDraft)"', check=False)
+        if state.startswith("MERGED"):
+            return ""
+        if state.endswith("true"):
+            self.gh("pr", "ready", url, "--repo", self.repo)
+        r = subprocess.run(["gh", "pr", "merge", url, "--repo", self.repo, f"--{method}"],
+                           capture_output=True, text=True, env=self._env(), timeout=180)
+        return "" if r.returncode == 0 else one_line(r.stderr or r.stdout, 300)
+
     def sync_pr(self, branch: str, base: str, title: str, body_md: str) -> str:
         body_file = AD / "logs" / "pr_body.md"
         atomic_write(body_file, body_md[:60000])
-        url = self.gh("pr", "list", "--repo", self.repo, "--head", branch, "--state", "open",
+        # --state all, not open: once a phase's pull request is merged its body should still be
+        # editable, and re-creating one for a branch already merged fails ("no commits between").
+        url = self.gh("pr", "list", "--repo", self.repo, "--head", branch, "--state", "all",
                       "--json", "url", "--jq", '.[0].url // ""')
         if url:
             self.gh("pr", "edit", url, "--repo", self.repo, "--body-file", str(body_file))
