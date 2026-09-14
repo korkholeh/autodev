@@ -121,17 +121,26 @@ class GitHub:
         self.push(base, src=base)
         return base
 
-    def merge(self, url: str, method: str = "merge") -> str:
+    def merge(self, url: str, base: str = "", method: str = "merge") -> str:
         """Take a draft pull request out of draft and merge it. Returns "" when it was merged.
+
+        `base` is where it must land. Merging the one below it is supposed to retarget this one
+        there automatically, but that is GitHub's bookkeeping happening while the run is already
+        asking for the next merge — and a stale base would merge this phase into the phase below
+        instead of into the base branch, silently. Since the caller only reaches this pull request
+        once everything under it has landed, pointing it at the base first is always right.
 
         The method is a real merge commit on purpose. Squash and rebase rewrite the commits, and
         every pull request stacked above this one is based on the commits as they are — rewriting
         them turns the rest of the stack into conflicts against history that no longer exists."""
-        state = self.gh("pr", "view", url, "--repo", self.repo, "--json", "state,isDraft",
-                        "--jq", '"\(.state)\t\(.isDraft)"', check=False)
+        state = self.gh("pr", "view", url, "--repo", self.repo, "--json", "state,isDraft,baseRefName",
+                        "--jq", '"\(.state)\t\(.isDraft)\t\(.baseRefName)"', check=False)
+        fields = state.split("\t")
         if state.startswith("MERGED"):
             return ""
-        if state.endswith("true"):
+        if base and len(fields) == 3 and fields[2] != base:
+            self.gh("pr", "edit", url, "--repo", self.repo, "--base", base)
+        if len(fields) > 1 and fields[1] == "true":
             self.gh("pr", "ready", url, "--repo", self.repo)
         r = subprocess.run(["gh", "pr", "merge", url, "--repo", self.repo, f"--{method}"],
                            capture_output=True, text=True, env=self._env(), timeout=180)

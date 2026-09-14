@@ -1215,7 +1215,7 @@ class Orchestrator:
         for label, item in pending:
             if item.get("merged"):
                 continue
-            problem = self.github.merge(item["pr_url"])
+            problem = self.github.merge(item["pr_url"], base=st.get("base_branch") or "")
             if problem:
                 self.event(f"{label}-merge", "refused", problem)
                 return

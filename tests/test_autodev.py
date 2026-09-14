@@ -1624,19 +1624,28 @@ class StackedPullRequests(TempCwd):
         o = self.orch(phases)
         o.merged = []
 
-        def merge(url, method="merge"):
+        def merge(url, base="", method="merge"):
             if url in refuse:
                 return "required status check is pending"
-            o.merged.append(url)
+            o.merged.append((url, base))
             return ""
         o.github.merge = merge
         return o
+
+    def test_each_merge_names_the_base_it_must_land_in(self):
+        """GitHub retargets the rest of the stack when the one below it merges, but that is its
+        bookkeeping racing the next merge — a stale base merges a phase into the phase below."""
+        o = self.merging([self.phase(1), self.phase(2)])
+        o.publish_stack()
+        o.merge_stack()
+        self.assertEqual([b for _, b in o.merged], ["main", "main"])
 
     def test_phases_merge_oldest_first(self):
         o = self.merging([self.phase(1), self.phase(2), self.phase(3)])
         o.publish_stack()
         o.merge_stack()
-        self.assertEqual(o.merged, ["https://x/pull/1", "https://x/pull/2", "https://x/pull/3"])
+        self.assertEqual([u for u, _ in o.merged],
+                         ["https://x/pull/1", "https://x/pull/2", "https://x/pull/3"])
 
     def test_a_refusal_stops_the_chain_instead_of_skipping_ahead(self):
         """#2 is based on branch #1. Merging #3 while #1 is unmerged asks GitHub to merge against
@@ -1644,7 +1653,7 @@ class StackedPullRequests(TempCwd):
         o = self.merging([self.phase(1), self.phase(2), self.phase(3)], refuse=("https://x/pull/2",))
         o.publish_stack()
         o.merge_stack()
-        self.assertEqual(o.merged, ["https://x/pull/1"])
+        self.assertEqual([u for u, _ in o.merged], ["https://x/pull/1"])
 
     def test_a_merged_phase_is_not_merged_again(self):
         o = self.merging([self.phase(1), self.phase(2)])
@@ -1659,14 +1668,14 @@ class StackedPullRequests(TempCwd):
         o.publish_stack()
         o.merge_stack()
         self.assertEqual(o.merged, [])
-        o.github.merge = lambda url, method="merge": o.merged.append(url) or ""
+        o.github.merge = lambda url, base="", method="merge": o.merged.append((url, base)) or ""
         o.merge_stack()
-        self.assertEqual(o.merged, ["https://x/pull/1"])
+        self.assertEqual([u for u, _ in o.merged], ["https://x/pull/1"])
 
     def test_the_closing_pull_request_merges_last(self):
         o = self.finalized([self.phase(1)])
         o.merged = []
-        o.github.merge = lambda url, method="merge": o.merged.append(url) or ""
+        o.github.merge = lambda url, base="", method="merge": o.merged.append(url) or ""
         o.publish_stack()
         o.merge_stack()
         self.assertEqual(o.merged[-1], o.state["tail_pr"]["pr_url"])
