@@ -20,7 +20,12 @@ Rules:
    match a wrong value, no lint rule disabled to hide a finding. Fix the product instead.
 10. Use status `blocked` only if progress is truly impossible without a human (missing paid credentials, hardware,
     access). Otherwise make an assumption, log it, and continue.
-11. Finish with the required structured output.
+11. Never blame the environment on a hunch. Before you write that something has no TTY, no network, no git remote,
+    no credentials or no way to run — or mark a task `[~]` for such a reason — run the command that proves it and
+    paste the command and its exact output into `.autodev/DECISIONS.md`. The orchestrator re-checks the cheap ones
+    and flags the step that made an unfounded claim; an unproven limitation is a task you skipped, not one you
+    could not do.
+12. Finish with the required structured output.
 
 Working rules live in `.autodev/guides/` — read the ones this step names, not all of them. Stack commands and layout
 live in `.autodev/PROFILE.md`.

@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -67,6 +68,7 @@ class PhaseHarness:
         self.state = state
         self.route: list[str] = []
         self.labels: list[str] = []
+        self.prompts: list[str] = []
         self.surfaces: list[str] = []
         self.git_calls: list[tuple] = []
 
@@ -77,11 +79,13 @@ class PhaseHarness:
             "test_fix": {"status": "done", "summary": ""},
             "review": {"verdict": "approve", "summary": "", "findings": []},
             "review_fix": {"status": "done", "summary": ""},
+            "review_audit": {"verdict": "approve", "summary": "", "findings": []},
             "e2e": {"status": "done", "summary": ""},
             "e2e_fix": {"status": "done", "summary": ""},
             "docs": {"status": "done", "summary": ""},
         }
         self.tests_ok = [True] * 50          # consumed one per run_tests call
+        self.tests_ran = 7                   # how many tests the suite reports having run
         self.status = []                     # consumed one per `git status --porcelain` call
         self.e2e_ok = [True] * 50
         self.plan_tasks = "- [x] T1: done\n"
@@ -108,11 +112,15 @@ class PhaseHarness:
             return "0" * 40
         if args[:1] == ("status",):
             return self.status.pop(0) if self.status else ""
+        if args[:1] == ("write-tree",):
+            return "t" * 40
         return ""
 
-    def _session(self, label, prompt, model, schema, key, extra_disallowed=(), recheck=None):
+    def _session(self, label, prompt, model, schema, key, extra_disallowed=(), recheck=None,
+                 context_limit=0):
         step = self.state["step"]
         self.labels.append(label)
+        self.prompts.append(prompt)
         if step == "plan":
             (self.o.phase_dir(self.state["phase_index"]) / "PLAN.md").write_text(self.plan_tasks)
         value = self.returns[step]
@@ -120,7 +128,7 @@ class PhaseHarness:
 
     def _run_tests(self, pdir):
         ok = self.tests_ok.pop(0) if self.tests_ok else True
-        return ok, "exit 0" if ok else "exit 1: 2 failed"
+        return ok, "exit 0" if ok else "exit 1: 2 failed", self.tests_ran
 
     def _run_e2e(self, pdir):
         ok = self.e2e_ok.pop(0) if self.e2e_ok else True
@@ -187,12 +195,128 @@ class PhaseRouting(TempCwd):
 
     def test_phase_out_of_review_rounds_still_runs_e2e_and_docs(self):
         """Regression: it used to jump from the last review straight to the commit."""
-        h = self.drive(max_review_rounds=2)
+        h = self.drive(max_review_rounds=2, audit_fixes=False)
         h.returns["review"] = blocking_review
         route = h.run()
         self.assertEqual(route[-3:], ["e2e", "docs", "commit"])
         self.assertEqual(route.count("review"), 2)
         self.assertIn("not re-reviewed", " ".join(h.warnings))
+
+    def test_an_implementation_that_hands_over_continues_in_a_fresh_session(self):
+        h = self.drive()
+        runs = []
+
+        def implement(_h):
+            runs.append(1)
+            return {"status": "partial" if len(runs) < 3 else "done",
+                    "summary": "context full — handed over to a fresh session"}
+        h.returns["implement"] = implement
+        route = h.run()
+        self.assertEqual(route.count("implement"), 3)
+        self.assertEqual(h.warnings, [])
+
+    def test_the_last_rounds_fixes_are_audited_before_the_commit(self):
+        """Regression: the fixes of the final round reached the commit unseen by any reviewer."""
+        h = self.drive(max_review_rounds=2)
+        h.returns["review"] = blocking_review
+        route = h.run()
+        self.assertEqual(route, ["plan", "implement", "test", "review", "review_fix", "test",
+                                 "review", "review_fix", "test", "review_audit", "e2e", "docs", "commit"])
+        self.assertTrue((h.o.phase_dir(0) / "REVIEW-r2-audit.md").exists())
+        self.assertEqual(h.warnings, [])            # the fixes held, so there is nothing to report
+
+    def test_an_audit_sees_only_the_fixes(self):
+        h = self.drive(max_review_rounds=1)
+        h.returns["review"] = blocking_review
+        h.run()
+        audit = next(p for p in h.prompts if p.startswith("Step: AUDIT"))
+        self.assertIn("git diff " + "t" * 40, audit)     # the tree recorded before the fix session
+        self.assertIn("REVIEW-r1.md", audit)
+
+    def test_an_audit_that_finds_a_blocker_gets_one_fix_pass_and_says_so(self):
+        h = self.drive(max_review_rounds=1)
+        h.returns["review"] = blocking_review
+        h.returns["review_audit"] = blocking_review
+        route = h.run()
+        self.assertEqual(route, ["plan", "implement", "test", "review", "review_fix", "test",
+                                 "review_audit", "review_fix", "test", "e2e", "docs", "commit"])
+        warnings = " ".join(h.warnings)
+        self.assertIn("audit of the round-1 fixes found blocker/major findings", warnings)
+        self.assertIn("not re-checked", warnings)
+        self.assertEqual(sum(p.startswith("Step: APPLY REVIEW FIXES") for p in h.prompts), 2)
+
+    def test_the_second_fix_pass_reads_the_audit_not_the_review(self):
+        h = self.drive(max_review_rounds=1)
+        h.returns["review"] = blocking_review
+        h.returns["review_audit"] = blocking_review
+        h.run()
+        fixes = [p for p in h.prompts if p.startswith("Step: APPLY REVIEW FIXES")]
+        self.assertIn("REVIEW-r1.md", fixes[0])
+        self.assertIn("REVIEW-r1-audit.md", fixes[1])
+
+    def test_the_audit_can_be_turned_off(self):
+        h = self.drive(max_review_rounds=1, audit_fixes=False)
+        h.returns["review"] = blocking_review
+        self.assertNotIn("review_audit", h.run())
+
+    def test_a_review_that_returns_no_verdict_does_not_spend_its_round(self):
+        """Regression: a crashed or timed-out review used to cost the phase a whole round."""
+        h = self.drive()
+        seen = []
+
+        def review(_h):
+            seen.append(1)
+            if len(seen) == 1:
+                return {"status": "partial", "summary": "session timed out"}
+            return {"verdict": "approve", "summary": "", "findings": []}
+        h.returns["review"] = review
+        route = h.run()
+        self.assertEqual(route.count("review"), 2)
+        self.assertEqual(h.state["phases"][0].get("warnings"), [])
+        pdir = h.o.phase_dir(0)
+        self.assertTrue((pdir / "REVIEW-r1.md").exists())       # round 1, not round 2
+        self.assertFalse((pdir / "REVIEW-r2.md").exists())
+
+    def test_a_review_that_crashes_leaves_the_round_for_the_next_run(self):
+        h = self.drive()
+        boom = []
+
+        def review(_h):
+            if not boom:
+                boom.append(1)
+                raise autodev.StepFailed("stream died")
+            return {"verdict": "approve", "summary": "", "findings": []}
+        h.returns["review"] = review
+        h.state.update(step="review", phase_ctx={"base_sha": "0" * 40, "impl_runs": 1,
+                                                 "test_fix_attempts": 0, "review_round": 0,
+                                                 "review_attempts": 0, "warnings": []})
+        with self.assertRaises(autodev.StepFailed):
+            h.o.step_phase()
+        self.assertEqual(h.state["phase_ctx"]["review_round"], 0)   # the round survived the crash
+        h.o.step_phase()                                            # the restarted run reviews round 1
+        self.assertEqual(h.state["phase_ctx"]["review_round"], 1)
+        self.assertTrue((h.o.phase_dir(0) / "REVIEW-r1.md").exists())
+
+    def test_a_review_round_that_never_finishes_is_given_up_after_two_tries(self):
+        h = self.drive()
+        h.returns["review"] = lambda _h: {"status": "partial", "summary": "session timed out"}
+        route = h.run()
+        self.assertEqual(route.count("review"), 2)                  # both tries at round 1
+        self.assertIn("did not complete in 2 attempts", " ".join(h.warnings))
+        self.assertEqual(route[-3:], ["e2e", "docs", "commit"])
+
+    def test_a_suite_that_passes_without_running_a_test_is_a_warning(self):
+        """A green exit code over zero tests certifies nothing, and used to read as a pass."""
+        h = self.drive()
+        h.tests_ran = 0
+        h.run()
+        self.assertTrue(any("without running a single test" in w for w in h.warnings))
+
+    def test_a_suite_of_unknown_shape_is_not_second_guessed(self):
+        h = self.drive()
+        h.tests_ran = None                  # the runner's output was not recognised
+        h.run()
+        self.assertEqual(h.warnings, [])
 
     def test_failing_e2e_is_fixed_then_the_phase_carries_on(self):
         h = self.drive()
@@ -866,7 +990,7 @@ class SessionCorrection(TempCwd):
         o.wait_for_usage = lambda: False
         prompts, queue = [], list(results)
 
-        def run_claude(label, prompt, model, schema, resume=None, extra_disallowed=()):
+        def run_claude(label, prompt, model, schema, resume=None, extra_disallowed=(), context_limit=0):
             prompts.append(prompt)
             import json
             return {"session_id": "sid", "result": {"result": json.dumps(queue.pop(0))},
@@ -900,6 +1024,71 @@ class SessionCorrection(TempCwd):
 
 
 # --------------------------------------------------------------------------- usage guard
+class ContextHandover(TempCwd):
+    """A long session pays to re-read its whole conversation every turn, so it is cut off."""
+
+    def make(self, *turns):
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state["step"] = "implement"
+        Path(".autodev/logs").mkdir(parents=True, exist_ok=True)
+        o = autodev.Orchestrator(state)
+        o.check_stop = lambda: None
+        o.wait_for_usage = lambda: False
+        calls, queue = [], list(turns)
+        base = {"session_id": "sid", "result": None, "interrupted": None, "rejected": False,
+                "exit": 0, "seconds": 1, "context": 0}
+
+        def run_claude(label, prompt, model, schema, resume=None, extra_disallowed=(), context_limit=0):
+            calls.append({"prompt": prompt, "resume": resume, "context_limit": context_limit})
+            return {**base, **queue.pop(0)}
+        o.run_claude = run_claude
+        return o, calls
+
+    def full(self):
+        return {"interrupted": "context", "context": 250_000}
+
+    def done(self, status="done"):
+        return {"result": {"result": json.dumps({"status": status, "summary": "s"})}}
+
+    def test_a_full_context_is_asked_to_checkpoint_and_then_the_step_ends(self):
+        o, calls = self.make(self.full(), self.done("partial"))
+        res = o.session("p01-implement", "GO", "sonnet", autodev.STEP_SCHEMA, "status",
+                        context_limit=200_000)
+        self.assertEqual(res["status"], "partial")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["resume"], "sid")
+        self.assertIn("handed to a fresh session", calls[1]["prompt"])
+        self.assertIn("PLAN.md", calls[1]["prompt"])
+        self.assertEqual(calls[1]["context_limit"], 0)      # the checkpoint turn is never cut off
+
+    def test_a_session_that_will_not_checkpoint_is_dropped_as_partial(self):
+        o, calls = self.make(self.full(), self.full())
+        res = o.session("p01-implement", "GO", "sonnet", autodev.STEP_SCHEMA, "status",
+                        context_limit=200_000)
+        self.assertEqual(res["status"], "partial")
+        self.assertIn("context full", res["summary"])
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(o.state["active_session"])
+
+    def test_a_step_without_a_checkpoint_is_never_cut_off(self):
+        o, calls = self.make(self.done())
+        o.session("p01-review1", "GO", "opus", autodev.STEP_SCHEMA, "status")
+        self.assertEqual(calls[0]["context_limit"], 0)
+
+    def test_the_handover_is_visible_in_the_timeline(self):
+        o, _ = self.make(self.full(), self.done("partial"))
+        o.session("p01-implement", "GO", "sonnet", autodev.STEP_SCHEMA, "status",
+                  context_limit=200_000)
+        self.assertTrue(any(e["status"] == "handover" for e in o.state["events"]))
+
+    def test_a_turns_context_is_what_it_had_to_read(self):
+        self.assertEqual(util.turn_context({"input_tokens": 2, "cache_creation_input_tokens": 500,
+                                            "cache_read_input_tokens": 180_000, "output_tokens": 9}),
+                         180_502)
+        self.assertEqual(util.turn_context({}), 0)
+        self.assertEqual(util.turn_context(None), 0)
+
+
 class Usage(unittest.TestCase):
     def guard(self):
         return usage.UsageGuard(85.0, 97.0)
@@ -1109,12 +1298,130 @@ class Helpers(unittest.TestCase):
     def test_extract_json_ignores_objects_without_the_key(self):
         self.assertIsNone(util.extract_json({"result": '{"other": 1}'}, "status"))
 
+    def test_a_test_summary_ignores_the_doc_test_tail(self):
+        """Regression: the tail of `cargo test` is a doc-test block that always reads 0 passed."""
+        out = ("running 12 tests\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured\n"
+               "running 291 tests\ntest result: ok. 291 passed; 0 failed; 1 ignored; 0 measured\n"
+               "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured\n")
+        self.assertEqual(util.test_summary(out), ("303 passed, 0 failed", 303))
+
+    def test_a_test_summary_reads_the_usual_runners(self):
+        for out, expected in (
+                ("===== 1 failed, 12 passed, 2 skipped in 1.2s =====", ("12 passed, 1 failed, 2 skipped", 13)),
+                ("Tests:       1 failed, 12 passed, 13 total", ("12 passed, 1 failed", 13)),
+                ("Executed 34 tests, with 2 failures (0 unexpected) in 1.2s", ("32 passed, 2 failed", 34)),
+                ("ok  \tx/y\t0.1s\n--- FAIL: TestZ\nFAIL\tx/z\t0.2s", ("1 package(s) ok, 1 failing", None)),
+        ):
+            self.assertEqual(util.test_summary(out), expected, out)
+
+    def test_a_suite_that_ran_nothing_says_so(self):
+        self.assertEqual(util.test_summary("test result: ok. 0 passed; 0 failed"), ("no tests ran", 0))
+
+    def test_an_unrecognised_runner_leaves_the_summary_to_the_caller(self):
+        self.assertEqual(util.test_summary("built 3 targets\nDone."), ("", None))
+        self.assertEqual(util.test_summary(""), ("", None))
+
+    def test_dropped_tasks_are_the_tilde_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            plan = Path(d) / "PLAN.md"
+            plan.write_text("- [x] one\n- [ ] two\n- [~] three (no TTY here)\n")
+            self.assertEqual(util.dropped_tasks(plan), ["- [~] three (no TTY here)"])
+            self.assertEqual(util.dropped_tasks(Path(d) / "missing.md"), [])
+
     def test_unchecked_tasks_counts_open_boxes(self):
         with tempfile.TemporaryDirectory() as d:
             plan = Path(d) / "PLAN.md"
             plan.write_text("- [x] one\n- [ ] two\n* [ ] three\n- [~] skipped\n")
             self.assertEqual(util.unchecked_tasks(plan), 2)
             self.assertEqual(util.unchecked_tasks(Path(d) / "missing.md"), 0)
+
+
+class EnvironmentClaims(TempCwd):
+    """An excuse the orchestrator can disprove is contradicted in writing, not left standing."""
+
+    def orch(self):
+        autodev.AD.mkdir(parents=True, exist_ok=True)
+        state = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        state["step"] = "finalize"
+        o = autodev.Orchestrator(state)
+        o.notify = lambda msg: None
+        return o
+
+    @staticmethod
+    def probing(claim_word, answer):
+        """The shipped table with one probe stubbed, so the real pattern is what gets tested."""
+        table = []
+        for pattern, probe, claim, truth in autodev.ENV_CLAIMS:
+            table.append((pattern, (lambda: answer) if claim_word in claim else probe, claim, truth))
+        return unittest.mock.patch.object(autodev, "ENV_CLAIMS", tuple(table))
+
+    def claims(self, o):
+        return [e for e in o.state["events"] if e["status"] == "unfounded claim"]
+
+    def test_a_false_claim_is_flagged_everywhere_a_human_looks(self):
+        o = self.orch()
+        with self.probing("remote", True):
+            o.check_env_claims("finalize", "This working tree has no git remote configured.")
+        self.assertEqual(len(self.claims(o)), 1)
+        self.assertIn("git remote", self.claims(o)[0]["summary"])
+        self.assertTrue(o.state["run_warnings"])
+        self.assertIn("git remote", (autodev.AD / "DECISIONS.md").read_text())
+
+    def test_a_true_claim_is_left_alone(self):
+        o = self.orch()
+        with self.probing("remote", False):
+            o.check_env_claims("finalize", "This working tree has no git remote configured.")
+        self.assertEqual(self.claims(o), [])
+        self.assertEqual(o.state.get("run_warnings", []), [])
+
+    def test_the_tty_excuse_is_checked_against_a_real_pty(self):
+        o = self.orch()
+        o.check_env_claims("p07-implement", "- [~] T15 (this sandbox has no controlling TTY)")
+        self.assertEqual(len(self.claims(o)), 1)     # openpty() works wherever the tests run
+
+    def test_a_phase_claim_lands_on_the_phase(self):
+        o = self.orch()
+        o.state["phase_ctx"] = {"warnings": []}
+        with self.probing("remote", True):
+            o.check_env_claims("p01-implement", "there is no git remote here")
+        self.assertEqual(len(o.state["phase_ctx"]["warnings"]), 1)
+        self.assertEqual(o.state.get("run_warnings", []), [])
+
+    def test_a_probe_that_blows_up_does_not_take_the_run_down(self):
+        o = self.orch()
+
+        def boom():
+            raise OSError("no")
+        table = [(pat, boom if "remote" in claim else probe, claim, truth)
+                 for pat, probe, claim, truth in autodev.ENV_CLAIMS]
+        with unittest.mock.patch.object(autodev, "ENV_CLAIMS", tuple(table)):
+            o.check_env_claims("finalize", "no git remote configured")
+        self.assertEqual(self.claims(o), [])
+
+    def test_the_patterns_catch_the_excuse_and_not_the_subject(self):
+        """The real sentences these came from, and the ones a game about terminals writes anyway."""
+        excuses = ("This working tree has *no git remote* configured",
+                   "`gh run list` fails with \"no git remotes found\"",
+                   "this sandbox has no controlling TTY",
+                   "cannot be run to completion — no pty available",
+                   "gh is not authenticated in this environment")
+        innocent = ("there is no remote branch for this phase yet",
+                    "stdout is not a tty, so the progress bar is disabled",
+                    "the game refuses to start without a TTY, so it cannot be driven from a pipe",
+                    "documented the TTY probe in docs/dev/testing.md")
+        for text in excuses:
+            self.assertTrue(any(p.search(text) for p, *_ in autodev.ENV_CLAIMS), text)
+        for text in innocent:
+            self.assertFalse(any(p.search(text) for p, *_ in autodev.ENV_CLAIMS), text)
+
+    def test_text_that_blames_nothing_is_not_probed(self):
+        o = self.orch()
+        probed = []
+        table = [(pat, lambda: probed.append(1), claim, truth)
+                 for pat, probe, claim, truth in autodev.ENV_CLAIMS]
+        with unittest.mock.patch.object(autodev, "ENV_CLAIMS", tuple(table)):
+            o.check_env_claims("p01-docs", "Documented the CLI and the save format.")
+        self.assertEqual(probed, [])
 
 
 class ProfileDetection(TempCwd):
@@ -1902,7 +2209,7 @@ class SkillLayout(unittest.TestCase):
 
     def test_every_prompt_a_step_renders_exists(self):
         for name in ("_autonomy", "architect", "roadmap", "plan", "implement", "test_fix",
-                     "review", "review_fix", "e2e", "e2e_fix", "docs", "finalize"):
+                     "review", "review_fix", "review_audit", "e2e", "e2e_fix", "docs", "finalize"):
             self.assertTrue((util.PROMPTS_DIR / f"{name}.md").is_file(), f"prompts/{name}.md is missing")
 
     def test_a_prompt_renders_its_placeholders(self):

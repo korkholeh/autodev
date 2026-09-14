@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import pty
 import secrets
 import re
 import shutil
@@ -46,10 +47,49 @@ from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
 from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
                               STOP_FILE, SURFACE_LOG, StepFailed, StopRequested, atomic_write,
                               available_profiles, bullets, child_env, claude_flags, claude_version,
-                              detect_profile, extract_json, git, hm, log, one_line, render,
-                              set_log_path, slugify, ts, unchecked_tasks)
+                              detect_profile, dropped_tasks, extract_json, git, hm, log, one_line, render,
+                              set_log_path, slugify, test_summary, ts, turn_context, unchecked_tasks)
 
 PERMISSION_PROMPTS_MIN = (2, 1, 259)  # first version with --permission-prompts none
+REVIEW_ATTEMPTS = 2                   # tries at one review round before the phase gives up on it
+
+
+def _has_git_remote() -> bool:
+    return bool(git("remote", check=False).strip())
+
+
+def _can_open_pty() -> bool:
+    try:
+        master, slave = pty.openpty()
+    except OSError:
+        return False
+    os.close(master)
+    os.close(slave)
+    return True
+
+
+def _gh_is_authenticated() -> bool:
+    try:
+        return subprocess.run(["gh", "auth", "status"], capture_output=True,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# A session that cannot do something blames the environment far more readily than it blames itself,
+# and the excuse then travels: into PLAN.md as `[~]`, into the docs, into the morning handoff, where
+# it reads as a fact nobody checked. These are the excuses cheap enough to check here, so they are.
+ENV_CLAIMS = (
+    (re.compile(r"no git remotes?\b|has no git remote|without a git remote"
+                r"|no remotes?\s+(?:is |are )?(?:configured|found|set|available)", re.I),
+     _has_git_remote, "this repository has no git remote", "`git remote` names one"),
+    (re.compile(r"no controlling (?:tty|terminal)|cannot allocate a (?:pty|pseudo-?terminal)"
+                r"|(?:has|have) no (?:pty|tty)|there is no (?:pty|tty)"
+                r"|no (?:pty|tty|pseudo-?terminal) (?:is )?(?:available|allocated|here)", re.I),
+     _can_open_pty, "no terminal can be allocated here", "`pty.openpty()` succeeds in this process"),
+    (re.compile(r"gh (?:is )?not authenticated|not logged in to gh|gh auth (?:is )?missing", re.I),
+     _gh_is_authenticated, "the GitHub CLI is not authenticated", "`gh auth status` exits 0"),
+)
 BLOCKING = {"blocker", "major"}
 
 DEFAULTS = {
@@ -63,7 +103,11 @@ DEFAULTS = {
     "permission_mode": "auto",
     "max_test_fix": 3,
     "max_review_rounds": 2,
-    "max_impl_runs": 3,
+    "max_impl_runs": 6,      # a step that hands over on a full context needs room for the sessions
+    # Cost per turn is the whole conversation re-read, so one long session is far more expensive
+    # than the same work split: the phase-5 implementation of the run this was tuned on spent $22
+    # over 280 turns, most of it re-reading a context that ended up over 500k tokens.
+    "max_context_tokens": 200_000,   # hand a checkpointable step over above this (0 = never)
     "max_e2e_fix": 3,
     "max_hours": 0.0,        # stop the run after this much wall clock (0 = no ceiling)
     "max_sessions": 0,       # stop after this many sessions started in this run (0 = no ceiling)
@@ -75,6 +119,7 @@ DEFAULTS = {
     "e2e_down_cmd": "",      # stops them again
     "e2e_ready_url": "",     # polled until it answers before the suite runs
     "e2e_timeout": 45,       # minutes
+    "audit_fixes": True,     # check the last round's fixes, which no review round is left to see
     "docs": True,            # per-phase documentation step
     "finalize": True,        # closing documentation + handoff session
     "session_timeout": 180,  # minutes
@@ -194,6 +239,10 @@ RESUME_AFTER_LIMIT = ("The usage-limit window has reset. Continue exactly where 
 RESUME_AFTER_RESTART = ("The orchestrator was restarted while you were working on this step. Check the current "
                         "state of the files (git status, PLAN.md checkboxes) and continue the step to completion. "
                         "Then return the required structured output.")
+HAND_OVER = ("Your context is nearly full, so this step is being handed to a fresh session. Stop starting new "
+             "work now: make PLAN.md say exactly what is done (`- [x]`) and what is not, leave the tree in a "
+             "state that builds, and return the structured output with status `partial` and a summary telling "
+             "the next session where to pick up. Do not begin another task.")
 NUDGE = ("Autonomous mode: no human is available. If you asked a question or offered options, choose the "
          "recommended option (or the first one), append the decision to .autodev/DECISIONS.md and continue the "
          "step to completion. Then return the required structured output.")
@@ -268,7 +317,8 @@ def ensure_run_is_ours(state: dict, adopt: bool) -> None:
 # ----------------------------------------------------------------------------- orchestrator
 PHASE_STEPS = {         # phase step -> the Orchestrator method that runs it and names the next step
     "plan": "_plan", "implement": "_implement", "test": "_test", "test_fix": "_test_fix",
-    "review": "_review", "review_fix": "_review_fix", "e2e": "_e2e", "e2e_fix": "_e2e_fix",
+    "review": "_review", "review_fix": "_review_fix", "review_audit": "_review_audit",
+    "e2e": "_e2e", "e2e_fix": "_e2e_fix",
     "docs": "_docs", "commit": "_commit",
 }
 
@@ -302,6 +352,7 @@ class Orchestrator:
         self.cfg = state["config"]
         self.guard = UsageGuard(self.cfg["threshold"], self.cfg["weekly_threshold"])
         self.child: subprocess.Popen | None = None
+        self.env_claims_seen: set = set()       # one disproved excuse, one line in DECISIONS.md
         self.surface_proc: subprocess.Popen | None = None
         self.stop_flag = False
         self.supports_prompts_none = False
@@ -360,6 +411,45 @@ class Orchestrator:
         so their warnings would otherwise live only in the timeline — or be pinned on whichever
         phase committed next."""
         self.state.setdefault("run_warnings", []).append(f"{ts()} — {line}")
+
+    def check_env_claims(self, label: str, *texts) -> None:
+        """Contradict, in writing, an environment excuse the orchestrator can disprove.
+
+        A wrong one is expensive: in the run this was written for, a phase skipped two of its
+        acceptance criteria because "this sandbox has no controlling TTY" (it has), and the morning
+        handoff led with "no git remote is configured" (there is one). Neither claim was checked by
+        anything, and both outlived the session that made them."""
+        blob = "\n".join(t for t in texts if t)
+        if not blob:
+            return
+        for pattern, probe, claim, truth in ENV_CLAIMS:
+            if not pattern.search(blob):
+                continue
+            try:
+                contradicted = probe()
+            except Exception as e:                      # a probe must never take the run down
+                log(f"WARN env-claim probe failed for {label}: {e}")
+                continue
+            if not contradicted:
+                continue
+            msg = (f"{label} said {claim} — but {truth}. Anything skipped, deferred or marked `[~]` "
+                   "for that reason is undone, not impossible.")
+            log(f"WARN {msg}")
+            self.event(label, "unfounded claim", msg)
+            self.note_warning(msg)
+            if (label, claim) not in self.env_claims_seen:
+                self.env_claims_seen.add((label, claim))
+                self.record_decision(msg)
+
+    def note_warning(self, line: str) -> None:
+        """Put a warning where a human will read it: on the phase if one is running, else on the run."""
+        ctx = self.state.get("phase_ctx")
+        if isinstance(ctx, dict) and isinstance(ctx.get("warnings"), list):
+            if line not in ctx["warnings"]:
+                ctx["warnings"].append(line)
+            return
+        if not any(w.endswith(line) for w in self.state.get("run_warnings", [])):
+            self.warn_run(line)
 
     def record_decision(self, line: str) -> None:
         """Append a line to DECISIONS.md the same way the sessions do, so a human reads one list."""
@@ -676,14 +766,14 @@ class Orchestrator:
         self.state["active_session"] = {"label": label, "session_id": session_id}
         self.save()
 
-    def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=()):
+    def run_claude(self, label, prompt, model, schema, resume=None, extra_disallowed=(), context_limit=0):
         cfg, st = self.cfg, self.state
         st["session_counter"] = st.get("session_counter", 0) + 1
         base = AD / "logs" / f"{st['session_counter']:03d}-{label}"
         cmd = self.session_command(prompt, model, schema, resume, extra_disallowed)
 
         out = {"session_id": resume, "result": None, "interrupted": None, "rejected": False,
-               "exit": None, "budget": ""}
+               "exit": None, "budget": "", "context": 0}
         started = time.time()
         log(f"▶ {label} [{model}]" + (f" resume {resume[:8]}" if resume else ""))
         with open(f"{base}.jsonl", "a", encoding="utf-8") as jf, open(f"{base}.stderr.log", "a") as ef:
@@ -703,7 +793,10 @@ class Orchestrator:
                     if sid and out["session_id"] != sid:
                         out["session_id"] = sid      # the main loop writes it to disk (note_session)
                     t = ev.get("type")
-                    if t == "rate_limit_event":
+                    if t == "assistant":
+                        out["context"] = max(out["context"],
+                                             turn_context((ev.get("message") or {}).get("usage")))
+                    elif t == "rate_limit_event":
                         info = ev.get("rate_limit_info") or {}
                         self.guard.observe(info)
                         if info.get("status") == "rejected":
@@ -739,6 +832,10 @@ class Orchestrator:
                     if bad:
                         out["interrupted"] = "limit"
                         log(f"{label}: {reason} — interrupting session to pause")
+                    elif context_limit and out["context"] > context_limit:
+                        out["interrupted"] = "context"
+                        log(f"{label}: context reached {out['context']:,} tokens "
+                            f"(limit {context_limit:,}) — asking it to hand over")
                 if out["interrupted"]:
                     self._interrupt(proc)
             th.join(timeout=30)
@@ -773,16 +870,24 @@ class Orchestrator:
             return None
         return CMD_CORRECTION.replace("{{problems}}", "\n".join(problems))
 
-    def session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None):
-        """One logical step, with the guides it was handed checked afterwards (see `check_guides`)."""
+    def session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None,
+                context_limit=0):
+        """One logical step, with the guides it was handed checked afterwards (see `check_guides`).
+
+        `context_limit` is for steps that can hand their work over — the ones that keep a checkpoint
+        on disk, so a fresh session can pick it up from there and stop paying for the old one."""
         guides = self.guides_digest()
         try:
-            return self._session(label, prompt, model, schema, required_key, extra_disallowed, recheck)
+            res = self._session(label, prompt, model, schema, required_key, extra_disallowed, recheck,
+                                context_limit)
+            self.check_env_claims(label, res.get("summary", ""))
+            return res
         finally:
             self.sessions_this_run += 1     # one step, however many resumes it took
             self.check_guides(label, guides)
 
-    def _session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None):
+    def _session(self, label, prompt, model, schema, required_key, extra_disallowed=(), recheck=None,
+                 context_limit=0):
         """Run one logical step to completion: handles limit pauses, resumes, nudges, restarts.
 
         `recheck` gets the structured output and returns a complaint to send back, or None. The
@@ -792,7 +897,7 @@ class Orchestrator:
                   "(if structured output is unavailable, end your final message with one ```json block):\n"
                   f"```json\n{json.dumps(schema, indent=1)}\n```\n")
         resume, cur, nudges, total_secs, total_cost = None, prompt, 0, 0, 0.0
-        rejections, corrections = 0, 0
+        rejections, corrections, handing_over = 0, 0, False
         act = self.state.get("active_session")
         if act and act.get("label") == label and act.get("session_id"):
             resume, cur = act["session_id"], RESUME_AFTER_RESTART
@@ -800,7 +905,8 @@ class Orchestrator:
             self.check_stop()
             self.wait_for_usage()
             before_cost = self.state["totals"]["cost_usd"]
-            out = self.run_claude(label, cur, model, schema, resume, extra_disallowed)
+            out = self.run_claude(label, cur, model, schema, resume, extra_disallowed,
+                                  context_limit=0 if handing_over else context_limit)
             total_secs += out["seconds"]
             total_cost += self.state["totals"]["cost_usd"] - before_cost
             if out["interrupted"] == "stop":
@@ -824,6 +930,18 @@ class Orchestrator:
                 if out["session_id"]:
                     resume, cur = out["session_id"], RESUME_AFTER_LIMIT
                 continue
+            if out["interrupted"] == "context":
+                # the hand-over turn itself is not interrupted, so a session gets exactly one
+                if out["session_id"] and not handing_over:
+                    handing_over = True
+                    self.event(label, "handover", f"context reached {out['context']:,} tokens — "
+                                                  "checkpointing for a fresh session")
+                    resume, cur = out["session_id"], HAND_OVER
+                    continue
+                self.state["active_session"] = None
+                self.event(label, "partial", "context full — handed over to a fresh session",
+                           total_secs, round(total_cost, 2))
+                return {"status": "partial", "summary": "context full — handed over to a fresh session"}
             if out["interrupted"] == "timeout":
                 self.state["active_session"] = None
                 self.event(label, "timeout", "session exceeded time limit", total_secs, round(total_cost, 2))
@@ -884,14 +1002,25 @@ class Orchestrator:
 
     # ---- tests & git -------------------------------------------------------------
     def run_tests(self, pdir: Path):
+        """Run the suite; return (passed, one-line summary, tests that actually ran).
+
+        The count is `None` when the runner's output is not recognised — see `test_summary`."""
         cmd = self.state["project"].get("test_command")
         if not cmd:
-            return True, "no test command configured — skipped"
+            return True, "no test command configured — skipped", None
         log(f"running tests: {cmd}")
-        return self._shell(cmd, self.cfg["test_timeout"], pdir / "TEST_OUTPUT.txt", "test command")
+        code, tail, output = self._shell(cmd, self.cfg["test_timeout"], pdir / "TEST_OUTPUT.txt",
+                                         "test command")
+        counted, ran = test_summary(output)
+        # a failing run keeps its last line too: that is where the runner says what went wrong
+        detail = f"{counted} — {tail}" if counted and code != 0 else (counted or tail)
+        return code == 0, f"exit {code}: {detail}", ran
 
     def _shell(self, cmd: str, minutes: int, out_file: Path | None = None, label: str = ""):
-        """Run a shell command in its own process group; return (ok, tail-of-output)."""
+        """Run a shell command in its own process group; return (exit code, last line, all output).
+
+        The whole output comes back because the last line of a test run is not its result — see
+        `test_summary` — and because `out_file` only keeps the tail."""
         proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, text=True, env=child_env(), start_new_session=True)
         try:
@@ -906,7 +1035,7 @@ class Orchestrator:
         if out_file is not None:
             atomic_write(out_file, f"$ {cmd}\n# exit code: {code}   # {ts()}\n\n" + "\n".join(lines[-400:]) + "\n")
         last = next((ln for ln in reversed(lines) if ln.strip()), "")
-        return code == 0, f"exit {code}: {last}"
+        return code, last, output or ""
 
     def e2e_command(self) -> str:
         cmd = ((self.state.get("project") or {}).get("e2e_command") or "").strip()
@@ -1016,7 +1145,8 @@ class Orchestrator:
         if not cmd:
             return True, "no e2e command configured — skipped"
         log(f"running e2e: {cmd}")
-        return self._shell(cmd, self.cfg["e2e_timeout"], pdir / "E2E_OUTPUT.txt", "e2e suite")
+        code, tail, _ = self._shell(cmd, self.cfg["e2e_timeout"], pdir / "E2E_OUTPUT.txt", "e2e suite")
+        return code == 0, f"exit {code}: {tail}"
 
     def note_command_files(self, staged) -> None:
         """Say when a commit changes a file that decides what the project's commands actually run.
@@ -1449,7 +1579,7 @@ class Orchestrator:
         cfg, st = self.cfg, self.state
         if not run.ctx.get("base_sha"):
             run.ctx.update(base_sha=git("rev-parse", "HEAD"), impl_runs=0, test_fix_attempts=0,
-                           review_round=0, warnings=[])
+                           review_round=0, review_attempts=0, warnings=[])
         run.ph["status"] = "in_progress"
         res = self.session(run.label, render("plan", **run.common), cfg["model_plan"], STEP_SCHEMA, "status",
                            recheck=lambda d: self.command_complaint(d, ("test_command",)))
@@ -1466,9 +1596,12 @@ class Orchestrator:
         cfg = self.cfg
         run.ctx["impl_runs"] += 1
         res = self.session(run.label, render("implement", run=run.ctx["impl_runs"], **run.common),
-                           cfg["model_impl"], STEP_SCHEMA, "status")
+                           cfg["model_impl"], STEP_SCHEMA, "status",
+                           context_limit=int(cfg.get("max_context_tokens") or 0))
         if res["status"] == "blocked":
             raise StepFailed(f"phase {run.n} implementation blocked: {res.get('summary')}")
+        # a task dropped as `[~]` carries its reason with it, and the reason is often the environment
+        self.check_env_claims(run.label, *dropped_tasks(run.dir / "PLAN.md"))
         left = unchecked_tasks(run.dir / "PLAN.md")
         if (res["status"] == "partial" or left) and run.ctx["impl_runs"] < cfg["max_impl_runs"]:
             log(f"phase {run.n}: {left} task(s) left — continuing in a fresh session")
@@ -1480,8 +1613,11 @@ class Orchestrator:
     def _test(self, run: "PhaseRun") -> str:
         if not (self.state["project"].get("test_command") or "").strip():
             run.ctx["warnings"].append("no test command configured — the unit suite never ran")
-        ok, summary = self.run_tests(run.dir)
+        ok, summary, ran = self.run_tests(run.dir)
         self.event(f"p{run.n:02d}-tests", "pass" if ok else "fail", summary)
+        if ok and ran == 0:
+            self.note_warning(f"`{self.state['project'].get('test_command')}` passed without running "
+                              "a single test — this phase is committed unverified")
         if ok:
             return run.ctx.get("after_tests") or self.next_review(run)
         if run.ctx["test_fix_attempts"] >= self.cfg["max_test_fix"]:
@@ -1500,12 +1636,18 @@ class Orchestrator:
         return "test"                           # after_tests still points where the phase was going
 
     def _review(self, run: "PhaseRun") -> str:
+        """Review the phase once. A round counts only when its verdict reaches the disk.
+
+        The counter used to be raised before the session, so a review that never finished — a
+        crashed stream, a kill, a restart — still spent a round: the phase came back as round 2,
+        was told to check a `REVIEW-r1.md` nobody had written, and its one real review was gone."""
         cfg = self.cfg
-        run.ctx["review_round"] += 1
-        r = run.ctx["review_round"]
+        r = run.ctx.get("review_round", 0) + 1
+        run.ctx["review_attempts"] = attempts = run.ctx.get("review_attempts", 0) + 1
         git("add", "-A")  # so `git diff <base>` also shows new files
-        prev = (f"- Previous review: `{run.dir.as_posix()}/REVIEW-r{r - 1}.md` — check its blocker/major "
-                "findings were really fixed." if r > 1 else "")
+        prev_review = run.dir / f"REVIEW-r{r - 1}.md"
+        prev = (f"- Previous review: `{prev_review.as_posix()}` — check its blocker/major "
+                "findings were really fixed." if prev_review.exists() else "")
         marks = self.worktree_marks()
         res = self.session(f"{run.label}{r}", render("review", round=r, previous_review=prev, **run.common),
                            cfg["model_review"], REVIEW_SCHEMA, "verdict",
@@ -1519,7 +1661,12 @@ class Orchestrator:
             run.ctx["warnings"].append(f"review round {r} changed the working tree itself ({shown}); "
                                        "those edits are part of this phase's commit, unreviewed")
         if "verdict" not in res:
-            run.ctx["warnings"].append(f"review round {r} did not complete")
+            if attempts < REVIEW_ATTEMPTS:
+                log(f"phase {run.n}: review round {r} returned no verdict — running it again "
+                    f"({attempts + 1}/{REVIEW_ATTEMPTS})")
+                return "review"
+            run.ctx["review_round"], run.ctx["review_attempts"] = r, 0
+            run.ctx["warnings"].append(f"review round {r} did not complete in {attempts} attempts")
             return self.after_review(run.ph)
         findings = res.get("findings") or []
         md = [f"# Review — phase {run.n} round {r}", "", f"**Verdict:** {res['verdict']}", "",
@@ -1530,6 +1677,7 @@ class Orchestrator:
             if f.get("suggested_fix"):
                 md += [f"**Fix:** {f['suggested_fix']}", ""]
         atomic_write(run.dir / f"REVIEW-r{r}.md", "\n".join(md))
+        run.ctx["review_round"], run.ctx["review_attempts"] = r, 0   # the round is spent now, not before
         if any(f.get("severity") in BLOCKING for f in findings):
             return "review_fix"
         return self.after_review(run.ph)
@@ -1537,15 +1685,76 @@ class Orchestrator:
     def _review_fix(self, run: "PhaseRun") -> str:
         cfg = self.cfg
         r = run.ctx["review_round"]
-        res = self.session(f"{run.label}{r}", render("review_fix", round=r, **run.common),
+        source = run.ctx.get("fix_source") or f"REVIEW-r{r}.md"
+        # the tree as it is before the fixes: `git diff <tree>` then shows the fixes and nothing else,
+        # which is what makes auditing them affordable — no commit and no stash involved
+        git("add", "-A")
+        run.ctx["fix_tree"] = git("write-tree", check=False) or ""
+        res = self.session(f"{run.label}{r}", render("review_fix", round=r, review_file=source, **run.common),
                            cfg["model_impl"], STEP_SCHEMA, "status")
         if res["status"] == "blocked":
             run.ctx["warnings"].append(f"review fixes round {r} blocked: {one_line(res.get('summary'), 120)}")
-        if r >= cfg["max_review_rounds"]:
+        run.ctx["test_fix_attempts"] = 0
+        run.ctx["fix_source"] = ""
+        return self.to_tests(run, after=self.after_fixes(run))
+
+    def after_fixes(self, run: "PhaseRun") -> str:
+        """Where a phase goes once its review fixes are in.
+
+        Another round sees the fixes for free, so the audit is only for the last one — the round
+        whose fixes used to reach the commit unseen by anybody."""
+        cfg, r = self.cfg, run.ctx["review_round"]
+        if r < cfg["max_review_rounds"]:
+            return "review"
+        if cfg.get("audit_fixes") and not run.ctx.get("audit_done"):
+            return "review_audit"
+        if run.ctx.get("audit_fix_done"):
+            run.ctx["warnings"].append(f"the round-{r} audit's own findings were fixed and not re-checked")
+        elif not run.ctx.get("audit_done"):
             run.ctx["warnings"].append(f"review round {r} had blocker/major findings; fixes applied, "
                                        "not re-reviewed")
-        run.ctx["test_fix_attempts"] = 0
-        return self.to_tests(run, after=self.next_review(run))
+        return self.after_review(run.ph)
+
+    def _review_audit(self, run: "PhaseRun") -> str:
+        """Read the last round's fixes, and only those, before the phase is committed.
+
+        A phase that has spent its review rounds used to commit its final fixes unseen: four of the
+        seven phases of the run this was written for did, one of them carrying a blocker fix to the
+        input loop that no reviewer ever saw."""
+        cfg, r = self.cfg, run.ctx["review_round"]
+        run.ctx["audit_done"] = True
+        tree = run.ctx.get("fix_tree")
+        if not tree:
+            run.ctx["warnings"].append(f"the round-{r} fixes could not be audited: no before-tree was recorded")
+            return self.after_review(run.ph)
+        git("add", "-A")
+        source = run.ctx.get("audit_source") or f"REVIEW-r{r}.md"
+        res = self.session(f"{run.label}{r}", render("review_audit", round=r, fix_tree=tree,
+                                                     review_file=source, **run.common),
+                           cfg["model_review"], REVIEW_SCHEMA, "verdict",
+                           extra_disallowed=("Edit", "Write", "NotebookEdit"))
+        if "verdict" not in res:
+            run.ctx["warnings"].append(f"the audit of the round-{r} fixes did not complete")
+            return self.after_review(run.ph)
+        findings = res.get("findings") or []
+        md = [f"# Audit of the round-{r} fixes — phase {run.n}", "", f"**Verdict:** {res['verdict']}", "",
+              res.get("summary", ""), ""]
+        for f in findings:
+            md += [f"## [{f.get('severity', '?').upper()}] {f.get('title', '')}",
+                   f"`{f.get('file', '')}`" if f.get("file") else "", "", f.get("detail", ""), ""]
+            if f.get("suggested_fix"):
+                md += [f"**Fix:** {f['suggested_fix']}", ""]
+        name = f"REVIEW-r{r}-audit.md"
+        atomic_write(run.dir / name, "\n".join(md))
+        if not any(f.get("severity") in BLOCKING for f in findings):
+            return self.after_review(run.ph)
+        run.ctx["warnings"].append(f"the audit of the round-{r} fixes found blocker/major findings "
+                                   f"(see {run.dir.as_posix()}/{name})")
+        # one pass at the audit's own findings, and then the phase lands: `after_fixes` sees the
+        # audit is done and sends it on with a warning rather than around again
+        run.ctx["audit_fix_done"] = True
+        run.ctx["fix_source"] = run.ctx["audit_source"] = name
+        return "review_fix"
 
     def _with_surfaces(self, run: "PhaseRun", body, skipped: str) -> str:
         """Run a step against started surfaces, and always stop them unless the phase stays in e2e.
@@ -1590,7 +1799,7 @@ class Orchestrator:
         if nxt in ("docs", "commit"):
             # the unit suite has to still be green after fixing the product for end-to-end cases,
             # and afterwards the phase carries on to where it was going — not back into review
-            ok, summary = self.run_tests(run.dir)
+            ok, summary, _ = self.run_tests(run.dir)
             self.event(f"p{run.n:02d}-tests", "pass" if ok else "fail", summary + " (after e2e fixes)")
             if not ok:
                 run.ctx["test_fix_attempts"] = 0
@@ -1664,6 +1873,9 @@ class Orchestrator:
                            cfg["model_plan"], STEP_SCHEMA, "status")
         if res.get("status") == "blocked":
             log(f"WARN finalize blocked: {one_line(res.get('summary'), 200)}")
+        handoff = AD / "HANDOFF.md"
+        if handoff.exists():        # nothing reviews the briefing, so check what it blames at least
+            self.check_env_claims("finalize", handoff.read_text(errors="ignore"))
         self.commit("autodev: documentation, changelog and handoff", one_line(res.get("summary"), 400))
         st["finalized"] = True
         self.event("finalize", res.get("status", "done"), one_line(res.get("summary"), 200))
@@ -2065,6 +2277,8 @@ def main() -> int:
     run.add_argument("--e2e-ready-url", dest="e2e_ready_url", help="poll this URL until it answers before the suite")
     run.add_argument("--e2e-timeout", dest="e2e_timeout", type=int, help="minutes (default 45)")
     run.add_argument("--max-e2e-fix", dest="max_e2e_fix", type=int)
+    run.add_argument("--no-audit-fixes", dest="audit_fixes", action="store_const", const=False,
+                     help="skip the read-only check of the last review round's fixes")
     run.add_argument("--no-docs", dest="docs", action="store_const", const=False,
                      help="skip the per-phase documentation step")
     run.add_argument("--no-finalize", dest="finalize", action="store_const", const=False,
@@ -2073,6 +2287,9 @@ def main() -> int:
     run.add_argument("--max-test-fix", dest="max_test_fix", type=int)
     run.add_argument("--max-review-rounds", dest="max_review_rounds", type=int)
     run.add_argument("--max-impl-runs", dest="max_impl_runs", type=int)
+    run.add_argument("--max-context-tokens", dest="max_context_tokens", type=int, metavar="N",
+                     help="hand the implementation over to a fresh session once a turn reads more "
+                          "than N tokens of context (default 200000; 0 = never)")
     run.add_argument("--max-hours", dest="max_hours", type=float, metavar="H",
                      help="stop the run after H hours of wall clock (resume with the same command)")
     run.add_argument("--max-sessions", dest="max_sessions", type=int, metavar="N",

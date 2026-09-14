@@ -10,6 +10,7 @@ Work through the unchecked tasks of PLAN.md in order. For each task:
 2. Run the narrowest sufficient checks for what you touched (the full suite is `{{test_command}}`).
 3. Immediately mark it done in PLAN.md (`- [x]`) so the work is resumable if this session is interrupted.
    If a task proves wrong or unnecessary, mark it `- [~] … (reason)`; if something is missing, add a task.
+   An environment limitation is only a reason with the command that proves it, and its output, in `.autodev/DECISIONS.md`.
 
 Already-checked tasks were completed by a previous session: don't redo them, but repair them if they're broken.
 Keep the code consistent with `CLAUDE.md` and the patterns already in the repository; update `CLAUDE.md` when you add

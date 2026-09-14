@@ -1,6 +1,6 @@
 Step: APPLY REVIEW FIXES — phase {{n}}/{{total}}: "{{title}}" (round {{round}})
 
-Read the review `{{phase_dir}}/REVIEW-r{{round}}.md` and the plan `{{phase_dir}}/PLAN.md`.
+Read the review `{{phase_dir}}/{{review_file}}` and the plan `{{phase_dir}}/PLAN.md`.
 
 - Fix every blocker and major finding.
 - Fix minor findings when the fix is small and safe; skip nits unless trivial.

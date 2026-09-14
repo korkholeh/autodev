@@ -45,7 +45,8 @@ python3 ~/.claude/skills/autodev/scripts/autodev.py run --spec docs/spec.md
 architect ─► roadmap ─► for each phase:
    plan ─► implement (×N, while [ ] tasks remain) ─► tests ─┬─► review ─┬─► e2e ─┬─► docs ─► commit + tag
                                                             │          │        └─► e2e_fix (×≤3) ─► docs
-                                                            │          └─► review_fix ─► tests ─► review (round 2)
+                                                            │          └─► review_fix ─► tests ─┬─► review (round 2)
+                                                            │                                   └─► audit (last round)
                                                             └─► test_fix (≤3) ─► tests
                                                                                         ─► finalize (docs + HANDOFF)
 ```
@@ -56,6 +57,10 @@ architect ─► roadmap ─► for each phase:
   are up (a command that stays in the foreground needs `--e2e-ready-url`). First a plan with an oracle
   (`e2e/plans/<feature>.plan.yaml`), then the specs, then a run that fixes **the product**, not the tests.
   Services are brought up by the script (`--e2e-up-cmd`), not by the agent.
+- **audit** — the fixes of the *last* review round have no round left to check them, so a read-only session sees
+  exactly that diff (`git diff` against the tree recorded before the fix session) with the review it answered, and
+  says whether every blocker and major is really fixed. If it finds one that is not, the phase gets one more fix
+  pass and then lands with a warning. `--no-audit-fixes` skips it.
 - **docs** — `CLAUDE.md`, `docs/dev/` (for developers) and `docs/user/` (for users) + `CHANGELOG.md`.
 - **finalize** — reconciles all documentation with what was actually built, and writes `.autodev/HANDOFF.md` —
   the morning briefing.
@@ -107,6 +112,8 @@ from then on every session reads that file.
 | `--max-file-mb MB` | hold a staged file larger than this out of the commit (5 by default, 0 = no limit) |
 | `--adopt` | resume run state in `.autodev/` that this machine did not create |
 | `--no-docs`, `--no-finalize` | disable the documentation step / the final session |
+| `--no-audit-fixes` | skip the read-only check of the last review round's fixes |
+| `--max-context-tokens N` | hand the implementation to a fresh session once a turn reads more than N tokens of context (200000 by default, 0 = never) |
 | `--model-plan\|impl\|review\|qa` | models per step (opus / sonnet / opus / sonnet) |
 | `--max-test-fix`, `--max-e2e-fix`, `--max-review-rounds`, `--max-impl-runs` | loop limits |
 | `--max-hours H`, `--max-sessions N` | ceiling on one run — it stops and tells you how to continue (no ceiling by default) |
@@ -278,6 +285,44 @@ previous command in place. To let a project's own script through from the start,
 anything, so the branch would be committed, reviewed and documented unverified. If the architect and roadmap steps
 both end without a usable test command, the run fails there — minutes after launch — and tells you to pass
 `--test-cmd`. Resume with the same `run` command once you have.
+
+**One long session is the expensive way to do the same work.** Every turn is billed for re-reading the whole
+conversation, so cost grows with the square of a session's length: the phase-5 implementation of the run this was
+tuned on spent $22.57 over 280 turns, most of it re-reading a context that ended over 500k tokens. Prompts asking a
+session to stop when its context fills are not enough — that one never did. So the orchestrator reads the context
+size out of every turn, and when the implementation step passes `--max-context-tokens` (200k by default) it
+interrupts, asks that session for one last turn to checkpoint `PLAN.md` and hand over, and starts a fresh session
+on the same phase. `--max-impl-runs` (6 by default) caps how many times that can happen. Only the implementation
+step is cut off this way: it is the one that keeps a checkpoint a new session can pick up from.
+
+**The last round of fixes is audited.** A phase that has used up its review rounds used to commit whatever the last
+fix session wrote, unseen — four of the seven phases of that run did, one of them carrying a blocker fix to the
+input loop. Before the fix session runs, the orchestrator records the tree (`git add -A; git write-tree` — no
+commit, no stash), so afterwards `git diff <tree>` is exactly the fixes and nothing else. The audit session is
+read-only, sees that diff and the review it answered, and asks three questions: is every blocker and major really
+fixed in the product and covered by a test, did the fixes break anything else, and was any rejected finding argued
+in `DECISIONS.md`. It approves, or the phase gets one more fix pass and lands with a warning naming the audit file.
+
+**A green suite that ran nothing is a warning.** The summary in `PROGRESS.md` used to be the last line of the test
+output, and the last line of `cargo test` is a doc-test block that always reads `0 passed; 0 failed` — every phase of
+a run was recorded as having verified nothing. The runner's own summary lines are read instead (cargo, pytest,
+jest/vitest, `go test`, `xcodebuild`), so the timeline says `303 passed, 0 failed`; when a recognised suite exits 0
+having run no test at all, that goes in the phase's warnings, because a passing exit code over zero tests certifies
+nothing. An unrecognised runner falls back to the last line, as before.
+
+**A review round is spent only when its verdict lands.** The round counter used to be raised before the review
+session, so a review that never finished — a crashed stream, a kill, a restart — still cost the phase a round: it
+came back as round 2, was told to check findings in a `REVIEW-r<n-1>.md` nobody had written, and its one real review
+was gone. Now the round counts when `REVIEW-r<n>.md` is on disk. A round that returns no verdict is run once more,
+and only then given up with a warning; a session that crashes leaves the round for the next `run` to retry.
+
+**An environment excuse is checked.** A session that cannot do something blames the environment far more readily than
+itself, and the excuse travels: into `PLAN.md` as a `[~]` task, into the docs, into the morning handoff, where it
+reads as a fact nobody checked. Sessions are told that a limitation needs the command that proves it and its output
+in `DECISIONS.md`, and the cheap claims — no git remote, no TTY or pty, no `gh` authentication — are re-checked by
+the orchestrator against `git remote`, `pty.openpty()` and `gh auth status` in every step summary, in the `[~]` lines
+of a plan, and in `HANDOFF.md`. A claim the run can disprove is named in the log, the timeline, `DECISIONS.md` and
+the phase's warnings, so what was skipped for that reason reads as undone rather than impossible.
 
 **What a session can reach.** Sessions run with `--permission-mode auto` (a classifier checks each action) and
 `--permission-prompts none`. On top of that, a session gets no `AUTODEV_*` variable from the environment (the

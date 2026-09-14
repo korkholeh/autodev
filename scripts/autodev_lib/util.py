@@ -160,6 +160,82 @@ def unchecked_tasks(plan: Path) -> int:
     return len(re.findall(r"^\s*[-*]\s+\[ \]", plan.read_text(encoding="utf-8"), re.M))
 
 
+# A test run's last line is not its result: `cargo test` ends with a doc-test block that always
+# reads `0 passed; 0 failed`, so a summary taken from the tail reported every suite in the run as
+# having run nothing. Each family is recognised by the shape of its own summary line instead.
+TEST_FAMILIES = (
+    ("cargo", re.compile(r"^\s*test result:", re.I), "sum"),
+    ("pytest", re.compile(r"^=+.*\b\d+\s+(?:passed|failed|error|skipped)", re.I), "last"),
+    ("jest", re.compile(r"^\s*Tests:\s+\d", re.I), "last"),
+    ("xcode", re.compile(r"\bExecuted \d+ tests?,", re.I), "last"),
+    ("go", re.compile(r"^(?:ok\s|FAIL\b|---\s+FAIL)"), "go"),
+)
+_COUNT = re.compile(r"(\d+)\s+(passed|failed|errors?|skipped)\b", re.I)
+_XCODE = re.compile(r"Executed (\d+) tests?, with (\d+) failures?", re.I)
+
+
+def _counts(line: str) -> dict:
+    """passed / failed / skipped read out of one summary line, whatever the runner calls them."""
+    m = _XCODE.search(line)
+    if m:
+        total, failed = int(m.group(1)), int(m.group(2))
+        return {"passed": max(total - failed, 0), "failed": failed, "skipped": 0}
+    out = {"passed": 0, "failed": 0, "skipped": 0}
+    for n, word in _COUNT.findall(line):
+        word = word.lower()
+        key = "failed" if word.startswith("error") else word
+        out[key] = out.get(key, 0) + int(n)
+    return out
+
+
+def test_summary(output: str) -> tuple[str, int | None]:
+    """(one-line summary of a test run, number of tests that actually ran).
+
+    The count is `None` when no family is recognised — the caller then falls back to the tail of
+    the output, which is all an unknown runner offers. A recognised run of zero tests says so:
+    a suite that certifies nothing must not read as a green suite."""
+    lines = (output or "").splitlines()
+    for name, matcher, how in TEST_FAMILIES:
+        hits = [ln for ln in lines if matcher.search(ln)]
+        if not hits:
+            continue
+        if how == "go":
+            # `go test` names each failing test and then fails its package, so counting both
+            # reports one broken test twice: prefer the named tests when there are any.
+            named = [ln for ln in hits if ln.startswith("---")]
+            failed = len(named) or sum(1 for ln in hits if ln.startswith("FAIL"))
+            ok = sum(1 for ln in hits if ln.startswith("ok"))
+            return f"{ok} package(s) ok, {failed} failing", None
+        totals = {"passed": 0, "failed": 0, "skipped": 0}
+        for c in ([_counts(hits[-1])] if how == "last" else [_counts(ln) for ln in hits]):
+            for k, v in c.items():
+                totals[k] = totals.get(k, 0) + v
+        ran = totals["passed"] + totals["failed"]
+        if not ran and not totals["skipped"]:
+            return "no tests ran", 0
+        text = f"{totals['passed']} passed, {totals['failed']} failed"
+        if totals["skipped"]:
+            text += f", {totals['skipped']} skipped"
+        return (text if ran else f"no tests ran ({text})"), ran
+    return "", None
+
+
+def turn_context(usage: dict) -> int:
+    """How much conversation one assistant turn was billed to read.
+
+    Cached or not, every token of it is re-read on the next turn too, which is why a long session
+    costs so much more than the same work split across fresh ones."""
+    return sum(int((usage or {}).get(k) or 0) for k in
+               ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+
+
+def dropped_tasks(plan: Path) -> list[str]:
+    """The `- [~]` lines of a plan: tasks a session decided not to do, with its reason."""
+    if not plan.exists():
+        return []
+    return re.findall(r"^\s*[-*]\s+\[~\].*$", plan.read_text(encoding="utf-8"), re.M)
+
+
 def detect_profile() -> str:
     """Guess a stack profile from the files in the working directory (shallow — no deep tree walks)."""
     def read(*names) -> str:
