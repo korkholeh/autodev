@@ -8,6 +8,9 @@ end-to-end (e2e) QA → documentation → commit. Every step is a separate headl
 context. Works for native Swift apps (macOS, iOS), Rust TUIs, Django+React, FastAPI+React, Django+htmx, and any
 other stack (the `generic` profile).
 
+**New here?** [`GUIDE.md`](GUIDE.md) explains how a run works, what kind of project it suits, how to write a spec it
+can build from, and how to check the result in the morning. This page is the reference: every flag, every rule.
+
 ## Installation
 
 ```bash
