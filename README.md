@@ -149,6 +149,7 @@ then records the gap as a run warning in `PROGRESS.md`.
 | `--model-plan\|impl\|review\|qa` | models per step (opus / sonnet / opus / sonnet) |
 | `--max-test-fix`, `--max-e2e-fix`, `--max-review-rounds`, `--max-impl-runs` | loop limits |
 | `--max-hours H`, `--max-sessions N` | ceiling on one run — it stops and tells you how to continue (no ceiling by default) |
+| `--base-branch NAME` | the branch the run is based on: checked out if it exists, cut from the current one if it does not. Default: the branch checked out — and `main` in a repository with no commits |
 | `--gh-user LOGIN` | token via `gh auth token --user LOGIN`; the active gh account is **not switched** |
 | `--push phase\|end\|never` | when to push the `autodev/…` branch (with `--gh-user`, after every phase by default) |
 | `--pr` | a draft PR per phase, stacked, plus one for the whole run (`--pr single` for only the run's). See [Stacked pull requests](#stacked-pull-requests) |
@@ -259,6 +260,13 @@ one is based on, which would turn the rest of the stack into conflicts against h
 - the spec belongs to the run: a `--spec` that differs from the one being resumed is reported and ignored;
   `--fresh` is how you change it
 - the run needs a branch to start from, so a detached HEAD stops it before the first session (`doctor` says so too)
+- **a repository with no commits is put on `main`** before the first one, whatever `git init` called it: the base
+  branch is what every phase pull request opens against and what a remote adopts as its default on the first push,
+  so it is not left to `init.defaultBranch`. `--base-branch NAME` picks another name.
+- **in an existing project the branch checked out is the base**, and `--base-branch NAME` says otherwise: an
+  existing branch is checked out (uncommitted changes that are not the run's stop it, they are not carried across),
+  a name that does not exist yet is cut from the current branch. The launcher asks before it starts; the flag only
+  applies to a new run, since a resumed one already has its branches.
 - a resumed run puts itself back on its own branch first: if you left the repository on another branch (or on a
   detached HEAD) it checks the run's branch out again, and if there are uncommitted changes that are not the
   run's, it stops and leaves them alone

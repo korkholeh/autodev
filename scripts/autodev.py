@@ -104,6 +104,7 @@ ENV_CLAIMS = (
      _gh_is_authenticated, "the GitHub CLI is not authenticated", "`gh auth status` exits 0"),
 )
 BLOCKING = {"blocker", "major"}
+DEFAULT_BRANCH = "main"     # what a repository with no commits is given, whatever `git init` called it
 
 DEFAULTS = {
     "test_cmd": "",
@@ -155,6 +156,7 @@ DEFAULTS = {
     "gh_host": "github.com",
     "gh_repo": "",        # owner/name override (default: parsed from the remote URL)
     "remote": "origin",
+    "base_branch": "",    # the branch the run is based on (default: the one checked out; new repo: main)
     "git_name": "",       # override commit author name (default: GitHub profile name)
     "git_email": "",      # override commit email (default: <id>+<login>@users.noreply.github.com)
     "push": "auto",       # phase | end | never; auto = phase when gh_user is set, else never
@@ -270,6 +272,35 @@ def run_marker() -> Path:
     home = Path(os.environ.get("AUTODEV_HOME") or Path.home() / ".autodev")
     key = hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:16]
     return home / "runs" / f"{key}.json"
+
+
+def check_branch_name(name: str) -> None:
+    """Refuse a branch name git itself would refuse, while a human is still here to retype it."""
+    if subprocess.run(["git", "check-ref-format", "--branch", name], capture_output=True).returncode != 0:
+        raise StepFailed(f"`{name}` is not a name git accepts for a branch")
+
+
+def ensure_first_branch(name: str) -> None:
+    """Name the branch a repository with no commits is about to make its first one on.
+
+    `git init` follows `init.defaultBranch`, which on a machine nobody configured is still
+    `master`, so a project started with a plain `git init` would be handed a base branch nobody
+    chose — the one every phase pull request opens against, the one the run comes back to, and
+    the one a remote will adopt as its default on the first push. Renaming it here costs one
+    symbolic-ref; after the first commit it costs a force-push."""
+    head = git("symbolic-ref", "--short", "HEAD", check=False)
+    if head == name:
+        return
+    check_branch_name(name)
+    git("symbolic-ref", "HEAD", f"refs/heads/{name}")
+    log(f"repository has no commits — the first one goes on `{name}`"
+        + (f" (git init had named the branch `{head}`)" if head else ""))
+
+
+def dirty_files() -> list:
+    """Uncommitted changes that are not the orchestrator's own bookkeeping."""
+    return [ln for ln in git("status", "--porcelain", check=False).splitlines()
+            if ln.strip() and not ln[3:].lstrip('"').startswith(".autodev/")]
 
 
 def current_branch_or_fail() -> str:
@@ -615,9 +646,10 @@ class Orchestrator:
             log("not a git repo — running git init")
             git("init", "-q")
         if subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True).returncode != 0:
+            ensure_first_branch(cfg.get("base_branch") or DEFAULT_BRANCH)
             git("commit", "-q", "--allow-empty", "-m", "autodev: initial commit")
         if not st.get("branch"):
-            cur = current_branch_or_fail()
+            cur = self.resolve_base_branch()
             st["base_branch"] = cur
             if self.cfg.get("branch") and not cur.startswith("autodev/"):
                 cur = f"autodev/{slugify(Path(st['spec']).stem)}-{datetime.now():%Y%m%d-%H%M}"
@@ -650,6 +682,35 @@ class Orchestrator:
         st.pop("error", None)
         self.save()
 
+    def resolve_base_branch(self) -> str:
+        """The branch this run is based on: the one checked out, or the one the developer chose.
+
+        In an existing project that is nobody's default to pick — it is what every phase pull
+        request opens against, what `--merge-phases` writes to, and what the run comes back to at
+        the end. The pre-flight interview asks, and the answer arrives here as `--base-branch`: a
+        branch that exists is checked out, a name that does not is cut from HEAD."""
+        cur = current_branch_or_fail()
+        want = (self.cfg.get("base_branch") or "").strip()
+        if not want or want == cur:
+            return cur
+        check_branch_name(want)
+        if not git("rev-parse", "--verify", "-q", f"refs/heads/{want}", check=False):
+            git("checkout", "-q", "-b", want)
+            log(f"base branch `{want}` created from `{cur}` (--base-branch)")
+            self.record_decision(f"the run is based on `{want}`, a new branch cut from `{cur}` (--base-branch)")
+            return want
+        dirty = dirty_files()
+        if dirty:
+            raise StepFailed(
+                f"the run was asked to start from `{want}` (--base-branch), but HEAD is on `{cur}` "
+                f"with {len(dirty)} uncommitted change(s). Those are not the run's, so autodev does "
+                f"not carry them onto another branch: deal with them, check `{want}` out yourself, "
+                "and run the same command again.")
+        git("checkout", "-q", want)
+        log(f"base branch `{want}` checked out (HEAD was on `{cur}`)")
+        self.record_decision(f"the run is based on `{want}`, checked out at the start (--base-branch)")
+        return want
+
     def ensure_on_branch(self, branch: str) -> None:
         """Put a resumed run back on its own branch before it commits anything.
 
@@ -665,8 +726,7 @@ class Orchestrator:
             raise StepFailed(f"the branch this run works on (`{branch}`) no longer exists in this "
                              f"repository, and HEAD is on {where}. Restore the branch, or start over "
                              "with --fresh.")
-        dirty = [ln for ln in git("status", "--porcelain", check=False).splitlines()
-                 if ln.strip() and not ln[3:].lstrip('"').startswith(".autodev/")]
+        dirty = dirty_files()
         if dirty:
             raise StepFailed(
                 f"this run works on `{branch}`, but HEAD is on {where} with {len(dirty)} uncommitted "
@@ -2423,13 +2483,22 @@ def cmd_doctor(args) -> int:
             rep("OK" if git("config", "user.name", check=False) else "FAIL", "git identity (user.name)")
         born = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], capture_output=True).returncode == 0
         head = git("rev-parse", "--abbrev-ref", "HEAD", check=False) if born else ""
+        want = (getattr(args, "base_branch", None) or "").strip()
         if not born:      # a repository with no commits reports "HEAD" too, and is perfectly fine
-            rep("OK", "git: no commits yet — the run makes the first one on "
-                      + (git("symbolic-ref", "--short", "HEAD", check=False) or "the current branch"))
+            now = git("symbolic-ref", "--short", "HEAD", check=False)
+            first = want or DEFAULT_BRANCH
+            rep("OK", f"git: no commits yet — the run makes the first one on {first}"
+                      + (f" (git init named the branch {now}; the run renames it)" if now and now != first else ""))
+        elif head == "HEAD":
+            rep("FAIL", "git: detached HEAD — check out a branch first, the run needs a base branch to return to")
+        elif not want or want == head:
+            rep("OK", f"git: on branch {head} — the run is based on it; --base-branch NAME bases it "
+                      "on another branch, or cuts a new one from here")
+        elif git("rev-parse", "--verify", "-q", f"refs/heads/{want}", check=False):
+            rep("OK", f"git: --base-branch {want} exists — the run checks it out (HEAD is on {head}; "
+                      "uncommitted changes there stop it)")
         else:
-            rep("FAIL" if head == "HEAD" else "OK",
-                "git: detached HEAD — check out a branch first, the run needs a base branch to return to"
-                if head == "HEAD" else f"git: on branch {head}")
+            rep("OK", f"git: --base-branch {want} does not exist — the run cuts it from {head}")
         rep("OK" if Path(".gitignore").exists() else "WARN",
             "root .gitignore" + ("" if Path(".gitignore").exists() else
                                  " missing — whatever a session installs or generates lands in the index; "
@@ -2579,6 +2648,10 @@ def main() -> int:
     run.add_argument("--notify-cmd", dest="notify_cmd", help='shell command; message in $AUTODEV_MSG')
     run.add_argument("--lang", help="language of .autodev docs (default English)")
     run.add_argument("--no-branch", dest="branch", action="store_const", const=False)
+    run.add_argument("--base-branch", dest="base_branch", metavar="NAME",
+                     help="the branch the run is based on: checked out if it exists, otherwise cut "
+                          "from the current one (default: the branch checked out; a repository with "
+                          "no commits gets `main`)")
     run.add_argument("--no-caffeinate", dest="caffeinate", action="store_const", const=False)
     run.add_argument("--claude-bin", dest="claude_bin")
     run.add_argument("--adopt", action="store_true",
@@ -2623,6 +2696,8 @@ def main() -> int:
     doc.add_argument("--gh-repo", dest="gh_repo")
     doc.add_argument("--pr", action="store_true", help="check what the draft PRs need, as `run --pr` would")
     doc.add_argument("--remote")
+    doc.add_argument("--base-branch", dest="base_branch", metavar="NAME",
+                     help="check what `run --base-branch NAME` would do")
     doc.add_argument("--git-name", dest="git_name")
     doc.add_argument("--git-email", dest="git_email")
     doc.set_defaults(func=cmd_doctor)

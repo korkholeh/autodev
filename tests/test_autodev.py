@@ -625,6 +625,86 @@ class ResumedBranch(TempCwd):
         self.assertIn("--fresh", str(e.exception))
 
 
+class BaseBranch(TempCwd):
+    """Which branch the run is based on: given to a repository that has none, asked about when it has one."""
+
+    @staticmethod
+    def head():
+        return subprocess.run(["git", "symbolic-ref", "--short", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def init(self, branch="master", commit=True):
+        subprocess.run(["git", "init", "-q", "-b", branch, "."], check=True, capture_output=True)
+        for k, v in (("user.email", "t@example.com"), ("user.name", "T")):
+            subprocess.run(["git", "config", k, v], check=True, capture_output=True)
+        if commit:
+            subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "first"],
+                           check=True, capture_output=True)
+
+    def orch(self, **cfg):
+        state = autodev.new_state("spec.md", {**autodev.DEFAULTS, **cfg})
+        Path(".autodev").mkdir(exist_ok=True)
+        return autodev.Orchestrator(state)
+
+    def test_a_repository_with_no_commits_gets_main(self):
+        """Regression: a plain `git init` on a machine nobody configured makes `master`, and that
+        became the base branch of the run, the PR base, and the remote's default branch."""
+        self.init(commit=False)
+        autodev.ensure_first_branch(autodev.DEFAULT_BRANCH)
+        self.assertEqual(self.head(), "main")
+
+    def test_a_repository_already_on_main_is_left_alone(self):
+        self.init("main", commit=False)
+        autodev.ensure_first_branch(autodev.DEFAULT_BRANCH)
+        self.assertEqual(self.head(), "main")
+
+    def test_the_first_branch_can_be_named_something_else(self):
+        self.init(commit=False)
+        autodev.ensure_first_branch("trunk")
+        self.assertEqual(self.head(), "trunk")
+
+    def test_a_name_git_would_refuse_stops_the_run(self):
+        self.init(commit=False)
+        with self.assertRaises(util.StepFailed):
+            autodev.ensure_first_branch("not a branch")
+        self.assertEqual(self.head(), "master")
+
+    def test_without_the_flag_the_checked_out_branch_is_the_base(self):
+        self.init("work")
+        self.assertEqual(self.orch().resolve_base_branch(), "work")
+        self.assertEqual(self.head(), "work")
+
+    def test_a_base_branch_that_exists_is_checked_out(self):
+        self.init("main")
+        subprocess.run(["git", "branch", "develop"], check=True, capture_output=True)
+        o = self.orch(base_branch="develop")
+        self.assertEqual(o.resolve_base_branch(), "develop")
+        self.assertEqual(self.head(), "develop")
+        self.assertIn("develop", Path(".autodev/DECISIONS.md").read_text())
+
+    def test_a_base_branch_that_does_not_exist_is_cut_from_here(self):
+        self.init("main")
+        o = self.orch(base_branch="feature/night")
+        self.assertEqual(o.resolve_base_branch(), "feature/night")
+        self.assertEqual(self.head(), "feature/night")
+
+    def test_uncommitted_work_is_not_carried_onto_another_branch(self):
+        self.init("main")
+        subprocess.run(["git", "branch", "develop"], check=True, capture_output=True)
+        Path("mine.txt").write_text("half a thought\n")
+        with self.assertRaises(util.StepFailed) as e:
+            self.orch(base_branch="develop").resolve_base_branch()
+        self.assertIn("uncommitted", str(e.exception))
+        self.assertEqual(self.head(), "main")        # nothing was moved
+
+    def test_a_new_base_branch_carries_uncommitted_work_with_it(self):
+        """It is cut from HEAD, so the changes are already on it — the snapshot commit lands there."""
+        self.init("main")
+        Path("mine.txt").write_text("half a thought\n")
+        self.assertEqual(self.orch(base_branch="night").resolve_base_branch(), "night")
+        self.assertTrue(Path("mine.txt").exists())
+
+
 class CommandFiles(TempCwd):
     """What a commit changes about the project's own commands is named, not forbidden."""
 
@@ -1160,6 +1240,28 @@ class RunEntry(TempCwd):
                 claude_bin="/nonexistent-claude", profile=None, gh_host=None, gh_repo=None, remote=None))
         self.assertIn("no commits yet", out.getvalue())
         self.assertNotIn("detached HEAD", out.getvalue())
+
+    def test_doctor_says_an_empty_repository_gets_main(self):
+        subprocess.run(["git", "init", "-q", "-b", "master", "."], check=True, capture_output=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            autodev.cmd_doctor(argparse.Namespace(
+                spec=None, gh_user=None, git_email=None, git_name=None, no_smoke=True,
+                claude_bin="/nonexistent-claude", profile=None, gh_host=None, gh_repo=None, remote=None))
+        self.assertIn("the first one on main", out.getvalue())
+        self.assertIn("git init named the branch master", out.getvalue())
+
+    def test_doctor_says_what_base_branch_would_do(self):
+        subprocess.run(["git", "init", "-q", "-b", "main", "."], check=True, capture_output=True)
+        for k, v in (("user.email", "t@example.com"), ("user.name", "T")):
+            subprocess.run(["git", "config", k, v], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "first"], check=True, capture_output=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            autodev.cmd_doctor(argparse.Namespace(
+                spec=None, gh_user=None, git_email=None, git_name=None, no_smoke=True, base_branch="night",
+                claude_bin="/nonexistent-claude", profile=None, gh_host=None, gh_repo=None, remote=None))
+        self.assertIn("--base-branch night does not exist — the run cuts it from main", out.getvalue())
 
     def test_doctor_says_when_head_is_not_on_the_run_s_branch(self):
         subprocess.run(["git", "init", "-q", "-b", "main", "."], check=True)

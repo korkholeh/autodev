@@ -3,7 +3,7 @@ name: autodev
 description: Launch a fully autonomous development run from a specification file — a technology-agnostic pipeline that designs the architecture, plans phases, then for every phase plans → implements → tests → reviews → drives end-to-end QA → writes documentation → commits, each step in a separate headless Claude session, auto-pausing near the usage limit. Only when the user explicitly runs /autodev.
 argument-hint: <spec-file> [--profile <stack>] [--gh-user <login>] [--pr] [other autodev.py run flags]
 disable-model-invocation: true
-allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py *) Bash(tmux *) Bash(git status *) Bash(git log *) Bash(git init *) Read Write(.autodev/*) Edit
+allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py *) Bash(tmux *) Bash(git status *) Bash(git log *) Bash(git init *) Bash(git branch *) Read Write(.autodev/*) Edit
 ---
 
 # /autodev — launcher
@@ -24,6 +24,11 @@ Run `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py doctor --spec <spec-file>` a
   or hand the user the command. A missing **required** tool (FAIL) also stops `run` itself before the first
   session; a missing **recommended** one (WARN) only costs a phase some time. `run --skip-tool-check` starts
   anyway, for a toolchain this check cannot see on PATH.
+- **Base branch.** The doctor prints what the run would use. A repository with **no commits** gets `main` before
+  the first one, whatever `git init` called it — nothing to ask. In an **existing project**, ask before launching
+  which branch the run is based on: the one checked out (the default), or a new one cut from it
+  (`--base-branch <name>`). `git branch --list` shows what is there. Worth the question — it is the branch every
+  phase pull request opens against, the branch the run comes back to, and the one `--merge-phases` would write to.
 - **Existing run** in `.autodev/`: ask whether to resume (default) or start over (`--fresh`). If the doctor says
   the state was not started on this machine, it arrived with the repository — read `.autodev/state.json` with the
   user before offering `--adopt`, since it names the commands the orchestrator will run.

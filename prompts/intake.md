@@ -34,7 +34,7 @@ what the developer expects to type — that becomes the contract phase 1 must sa
   If credentials are missing, decide now: stub it, or let that phase report `blocked`.
 - **Multi-user or multi-tenant data** — the isolation rule, stated once, plainly.
 - **Existing codebase** — which conventions are binding, which parts must not be touched, whether a migration path
-  from live data is required.
+  from live data is required. (Which branch the run is based on is settled in the pre-flight, not here.)
 - **Distribution constraints** — code signing, notarization, app-store review, an offline install, a supported
   version floor.
 - **Non-functional numbers that change the design** — expected data volume, concurrency, a latency the product is

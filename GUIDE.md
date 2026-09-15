@@ -126,6 +126,7 @@ The flags worth deciding on the first night:
 | `--pr` / `--gh-user` | A PR per phase is far easier to review than one branch of nine commits. |
 | `--e2e-up-cmd` | Web stacks need their services up for end-to-end QA; without this the e2e step is skipped. |
 | `--web on` | Off by default. Turn it on if the work needs to look up an unfamiliar or fast-moving API. |
+| `--base-branch NAME` | Where the night's work is based. An empty repository gets `main`; an existing one uses the branch you are on unless you name another (or a new one to cut from here). |
 
 ---
 
