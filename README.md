@@ -80,6 +80,7 @@ Tests, e2e, commits, and state are handled by the script (no usage limit spent).
 |---|---|
 | `.autodev/HANDOFF.md` | morning briefing: what was done, what was verified, what is left, what a human must decide |
 | `.autodev/PROGRESS.md` | control document: status (and why it stopped), phases with their warnings, run warnings, timeline, usage |
+| `.autodev/REPORT.xlsx` | the run's numbers: time, tokens per model, cost per step and per phase, every session, a budget model — refreshed after each phase (gitignored, rebuild any time with `report`) |
 | `.autodev/ARCHITECTURE.md`, `RISKS.md` | design and risk register (architect step) |
 | `.autodev/ROADMAP.md` | phases with goal / deliverables / acceptance criteria / user_facing |
 | `.autodev/DECISIONS.md` | every decision the agents made on a human's behalf |
@@ -334,6 +335,14 @@ go, so four of the seven phases of that run spent a session to conclude "no chan
 but the session is handed the list of files the phase changed and told to check the documents covering those and
 nothing else — and a phase that changed nothing outside `.autodev/` skips the step entirely. When the session
 changes no file, the timeline says so rather than leaving a summary that reads like work.
+
+**The run keeps its own numbers.** After every phase and at the end of the run, the orchestrator writes
+`.autodev/REPORT.xlsx` from `state.json`: hours (working / paused on the limit / not running), tokens and cost per
+model, cost per step type and per phase, one row per session, and a budget sheet whose formulas estimate the next
+run from this one's measured per-phase cost. It is written by the script, so it costs no tokens and no session; it
+is gitignored, because it is derived. `python3 …/autodev.py report [--out FILE]` rebuilds it on demand — including
+for a run that predates this, which is recovered from `.autodev/logs/`. Without `openpyxl` installed the same table
+lands in `.autodev/REPORT.csv` instead.
 
 **The decision log is read in slices.** `DECISIONS.md` is the one file that grows all night — 164 KB and 216
 entries by the end of that run — and every plan, implementation and review was told to read it whole, which by the

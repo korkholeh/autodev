@@ -33,7 +33,7 @@ autodev = importlib.util.module_from_spec(_spec)
 sys.modules["autodev"] = autodev
 _spec.loader.exec_module(autodev)                 # this also puts scripts/ on sys.path
 
-from autodev_lib import commands, staging, usage, util   # noqa: E402  (enabled by the entry point)
+from autodev_lib import commands, report, staging, usage, util   # noqa: E402  (enabled by the entry point)
 
 
 class TempCwd(unittest.TestCase):
@@ -759,6 +759,91 @@ class DecisionsLog(TempCwd):
         self.assertIn("/^## p03-/,$p", autodev.PhaseRun(o, 3).common["decisions_tail"])
         state["phase_index"] = 0
         self.assertIn("/^## architect/,$p", autodev.PhaseRun(o, 0).common["decisions_tail"])
+
+
+class RunReport(TempCwd):
+    """The run's own numbers, written from state.json — no session, no tokens, no guessing."""
+
+    def state(self):
+        st = autodev.new_state("spec.md", dict(autodev.DEFAULTS))
+        st.update(created="2026-09-13 21:28:22", branch="autodev/x", status="done",
+                  events=[{"ts": "2026-09-14 14:51:25", "label": "run", "status": "done", "summary": ""}],
+                  phases=[{"title": "P1", "slug": "p1", "goal": "g", "status": "done", "warnings": ["w"]},
+                          {"title": "P2", "slug": "p2", "goal": "g", "status": "done", "warnings": []}])
+        st["totals"] = {"sessions": 3, "seconds": 7200, "cost_usd": 30.0, "paused": 3600,
+                        "models": {"sonnet-5": {"sessions": 2, "cost": 25.0, "in": 10, "cache_w": 100,
+                                                "cache_r": 9000, "out": 500, "think": 50}}}
+        st["sessions"] = [
+            {"n": 1, "label": "architect", "model": "opus", "turns": 20, "sec": 600, "cost": 5.0,
+             "in": 5, "cache_w": 50, "cache_r": 1000, "out": 200, "think": 10, "error": ""},
+            {"n": 2, "label": "p01-implement", "model": "sonnet", "turns": 180, "sec": 3600, "cost": 20.0,
+             "in": 5, "cache_w": 50, "cache_r": 7000, "out": 250, "think": 30, "error": ""},
+            {"n": 3, "label": "p02-review1", "model": "opus", "turns": 30, "sec": 3000, "cost": 5.0,
+             "in": 0, "cache_w": 0, "cache_r": 1000, "out": 50, "think": 10, "error": "aborted"}]
+        return st
+
+    def test_the_step_and_phase_come_out_of_the_label(self):
+        self.assertEqual(report.step_of("p04-review_fix2"), "review_fix")
+        self.assertEqual(report.step_of("architect"), "architect")
+        self.assertEqual(report.phase_of("p04-review_fix2"), "phase 4")
+        self.assertEqual(report.phase_of("finalize"), "run-level")
+
+    def test_the_summary_separates_working_from_waiting(self):
+        rows = dict(report.summary_rows(self.state()))
+        self.assertEqual(rows["Agent time, h"], 2.0)
+        self.assertEqual(rows["Paused on usage limit, h"], 1.0)
+        self.assertEqual(rows["Wall clock, h"], 17.38)
+        self.assertEqual(rows["Not running, h"], 14.38)
+        self.assertEqual(rows["Warnings on phases"], 1)
+
+    def test_a_workbook_has_a_sheet_for_each_way_of_reading_the_run(self):
+        openpyxl = __import__("importlib").util.find_spec("openpyxl")
+        if not openpyxl:
+            self.skipTest("openpyxl is not installed")
+        from openpyxl import load_workbook
+        path, note = report.write(self.state(), Path("REPORT.xlsx"))
+        self.assertEqual(note, "")
+        wb = load_workbook(path)
+        self.assertEqual(wb.sheetnames,
+                         ["Summary", "By model", "By step", "By phase", "Sessions", "Budget model"])
+        self.assertTrue(all(ws._charts for ws in wb if ws.title != "Budget model"))
+        rows = {r[0]: r[1:] for r in wb["By phase"].iter_rows(min_row=4, values_only=True)}
+        self.assertEqual(rows["phase 1"][1], 20.0)              # the implementation session's cost
+        self.assertEqual(rows["run-level"][0], 1)               # the architect
+
+    def test_without_openpyxl_the_same_numbers_land_in_a_csv(self):
+        real = report.write_xlsx
+
+        def missing(*a, **kw):
+            raise ImportError("no openpyxl")
+        report.write_xlsx = missing
+        self.addCleanup(lambda: setattr(report, "write_xlsx", real))
+        path, note = report.write(self.state(), Path("REPORT.xlsx"))
+        self.assertEqual(path.name, "REPORT.csv")
+        self.assertIn("pip install openpyxl", note)
+        text = path.read_text()
+        self.assertIn("p01-implement", text)
+        self.assertIn('"Agent time, h",2.0', text)
+
+    def test_a_run_with_no_sessions_yet_reports_nothing(self):
+        path, note = report.write(autodev.new_state("spec.md", dict(autodev.DEFAULTS)), Path("R.xlsx"))
+        self.assertIsNone(path)
+        self.assertIn("no sessions", note)
+
+    def test_an_older_run_is_recovered_from_its_logs(self):
+        logs = Path("logs")
+        logs.mkdir()
+        (logs / "001-p01-implement.jsonl").write_text(json.dumps({
+            "type": "result", "num_turns": 12, "duration_ms": 60000, "total_cost_usd": 1.5,
+            "modelUsage": {"claude-sonnet-5": {"inputTokens": 3, "cacheReadInputTokens": 900,
+                                               "outputTokens": 40, "costUSD": 1.4},
+                           "claude-haiku-4-5": {"inputTokens": 100, "costUSD": 0.1}}}) + "\n")
+        sessions = report.sessions_from_logs(logs)
+        self.assertEqual(sessions[0]["label"], "p01-implement")
+        self.assertEqual(sessions[0]["cache_r"], 900)
+        models = report.models_from_sessions(sessions)
+        self.assertEqual(sorted(models), ["haiku-4-5", "sonnet-5"])      # the split is kept
+        self.assertEqual(models["sonnet-5"]["cost"], 1.4)
 
 
 class ResumeHandle(TempCwd):

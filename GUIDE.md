@@ -155,9 +155,15 @@ While it runs:
 
 ```bash
 python3 ~/.claude/skills/autodev/scripts/autodev.py status   # where it is, last 8 events
+python3 ~/.claude/skills/autodev/scripts/autodev.py report   # rebuild .autodev/REPORT.xlsx now
 tail -f .autodev/autodev.log                                 # live
 touch .autodev/STOP                                          # stop gracefully at the next safe point
 ```
+
+**`.autodev/REPORT.xlsx` is written after every phase** and again when the run ends: hours split into working,
+paused on the usage limit and not running at all; tokens and cost per model; cost per step type and per phase; every
+session as a row; and a budget sheet that estimates your next run from this one's measured per-phase cost. Open it
+in the morning before the diff — it tells you what the night cost and which phase ate it.
 
 Restarting is the same command you launched with: the run picks up from the step it stopped at, and resumes the
 interrupted session rather than redoing it.

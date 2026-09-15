@@ -42,6 +42,7 @@ if str(_HERE) not in sys.path:              # so autodev_lib imports whether run
 
 from autodev_lib.commands import CMD_CORRECTION, CMD_FIELDS, command_allowed  # noqa: E402
 from autodev_lib.github import GitHub  # noqa: E402
+from autodev_lib import report  # noqa: E402
 from autodev_lib.staging import COMMAND_FILES, command_change, why_not_committable  # noqa: E402
 from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
 from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
@@ -559,7 +560,7 @@ class Orchestrator:
         set_log_path(AD / "autodev.log")
 
         (AD / ".gitignore").write_text("logs/\nguides/\nstate.json\nstate.json.tmp\nrun.pid\nSTOP\n"
-                                       "autodev.log\nconsole.log\n")
+                                       "autodev.log\nconsole.log\nREPORT.xlsx\nREPORT.csv\n")
         self.install_guides()
         dec = AD / "DECISIONS.md"
         if not dec.exists():
@@ -948,7 +949,47 @@ class Orchestrator:
         st["totals"]["seconds"] += secs
         st["totals"]["cost_usd"] += float(res.get("total_cost_usd") or 0)
         out["seconds"] = secs
+        self.record_usage(label, model, secs, res)
         return out
+
+    USAGE_FIELDS = (("inputTokens", "in"), ("cacheCreationInputTokens", "cache_w"),
+                    ("cacheReadInputTokens", "cache_r"), ("outputTokens", "out"),
+                    ("thinkingTokens", "think"))
+
+    def record_usage(self, label: str, model: str, secs: int, res: dict) -> None:
+        """One row per session and a per-model total, kept in state.json for `REPORT.xlsx`.
+
+        The numbers are in the logs too, but only as one `result` event at the end of a 3 MB stream
+        per session — reading 53 of those to answer "where did the night go" is not a question the
+        run should have to re-derive."""
+        st = self.state
+        usage = res.get("modelUsage") or {}
+        row = {"n": st["session_counter"], "label": label, "model": model, "sec": secs,
+               "turns": res.get("num_turns") or 0, "cost": round(float(res.get("total_cost_usd") or 0), 4),
+               "error": res.get("subtype", "") if res.get("is_error") else ""}
+        for _, short in self.USAGE_FIELDS:
+            row[short] = 0
+        for name, u in usage.items():
+            per = st["totals"].setdefault("models", {}).setdefault(
+                name.replace("claude-", ""), {"sessions": 0, "cost": 0.0})
+            per["sessions"] += 1
+            per["cost"] = round(per.get("cost", 0) + float(u.get("costUSD") or 0), 4)
+            for long, short in self.USAGE_FIELDS:
+                per[short] = per.get(short, 0) + int(u.get(long) or 0)
+                row[short] += int(u.get(long) or 0)
+        st.setdefault("sessions", []).append(row)
+
+    def write_report(self) -> None:
+        """Refresh `.autodev/REPORT.xlsx` — after every phase, and when the run ends."""
+        try:
+            path, note = report.write(self.state, AD / "REPORT.xlsx", AD / "logs")
+        except Exception as e:                  # a spreadsheet must never take a run down
+            log(f"WARN could not write the run report: {e}")
+            return
+        if note and note not in (self.state.get("run_warnings") or []):
+            log(f"report: {note}")
+        if path:
+            log(f"report: {path.as_posix()}")
 
     def command_complaint(self, data: dict, fields) -> str | None:
         """The message to send back when a session proposed a command the orchestrator will not run."""
@@ -2010,6 +2051,7 @@ class Orchestrator:
         self.event(f"p{run.n:02d}-commit", "done", sha or "no changes to commit")
         self.notify(f"autodev ✅ phase {run.n}/{run.total}: {run.ph['title']}")
         st["phase_index"], st["phase_ctx"] = run.i + 1, {}
+        self.write_report()
         return "plan"
 
     def after_review(self, ph: dict) -> str:
@@ -2086,6 +2128,7 @@ class Orchestrator:
             return 1
         finally:
             self.save()
+            self.write_report()
             if st.get("step") != "roadmap" or st.get("status") == "done":
                 self.publish(final=True)
                 self.save()
@@ -2218,7 +2261,8 @@ def new_state(spec: str, cfg: dict) -> dict:
             "run_id": secrets.token_hex(16),
             "project": {}, "phases": [], "phase_index": 0, "step": "architect", "phase_ctx": {}, "events": [],
             "session_counter": 0, "active_session": None,
-            "totals": {"sessions": 0, "seconds": 0, "cost_usd": 0.0, "paused": 0}}
+            "sessions": [],
+            "totals": {"sessions": 0, "seconds": 0, "cost_usd": 0.0, "paused": 0, "models": {}}}
 
 
 def cli_overrides(args) -> dict:
@@ -2294,6 +2338,22 @@ def cmd_status(_args) -> int:
     print("process:", "running" if alive else "not running")
     for e in st["events"][-8:]:
         print(f"  {e['ts']}  {e['label']}: {e['status']}  {e['summary'][:100]}")
+    return 0
+
+
+def cmd_report(args) -> int:
+    """Rebuild the run's spreadsheet on demand — it is derived from state.json, so it is never stale."""
+    if not STATE_FILE.exists():
+        print("no autodev run in this directory")
+        return 1
+    state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    path, note = report.write(state, Path(args.out) if args.out else AD / "REPORT.xlsx", AD / "logs")
+    if note:
+        print(note)
+    if not path:
+        print("nothing to report yet")
+        return 1
+    print(path.as_posix())
     return 0
 
 
@@ -2530,6 +2590,10 @@ def main() -> int:
 
     stat = sub.add_parser("status", help="show run status")
     stat.set_defaults(func=cmd_status)
+
+    rep = sub.add_parser("report", help="write .autodev/REPORT.xlsx from the run state")
+    rep.add_argument("--out", help="where to write it (default .autodev/REPORT.xlsx)")
+    rep.set_defaults(func=cmd_report)
 
     args = ap.parse_args()
     return args.func(args)
