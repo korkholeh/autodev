@@ -106,8 +106,12 @@ Write the spec in whatever language you think in; documents and code stay in the
 
 Three things happen before any code:
 
-1. **`doctor`** — checks the spec, git identity, toolchain, and runs one real headless session, so an expired login
-   or a hook that blocks headless mode is found now instead of at 3am.
+1. **`doctor`** — checks the spec, git identity, and the toolchain your stack builds with (git, tmux, the
+   compilers and interpreters of the detected profile — each missing one comes with the command that installs
+   it), then runs one real headless session, so an expired login or a hook that blocks headless mode is found
+   now instead of at 3am. The run checks the same toolchain again in its first seconds and refuses to start
+   without it: a session that cannot compile does not report a missing compiler, it reports a phase it finished
+   some other way.
 2. **The interview** — at most six questions, only about what the spec does not answer, each with a recommended
    default. This is the last time anyone asks you anything. Answer carefully; "whatever you think" costs more here
    than anywhere else.

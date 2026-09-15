@@ -33,7 +33,7 @@ autodev = importlib.util.module_from_spec(_spec)
 sys.modules["autodev"] = autodev
 _spec.loader.exec_module(autodev)                 # this also puts scripts/ on sys.path
 
-from autodev_lib import commands, report, staging, usage, util   # noqa: E402  (enabled by the entry point)
+from autodev_lib import commands, report, staging, toolchain, usage, util   # noqa: E402  (enabled by the entry point)
 
 
 class TempCwd(unittest.TestCase):
@@ -1765,6 +1765,80 @@ class ProfileDetection(TempCwd):
     def test_every_shipped_profile_is_offered(self):
         self.assertIn("generic", util.available_profiles())
         self.assertNotIn("README", util.available_profiles())
+
+
+class Toolchain(TempCwd):
+    """The pre-flight check for compilers and interpreters, and what it tells the user to install."""
+
+    def orch(self, profile, **cfg):
+        conf = dict(autodev.DEFAULTS)
+        conf.update(cfg)
+        o = autodev.Orchestrator(autodev.new_state("spec.md", conf))
+        o.state["profile"] = profile
+        return o
+
+    @staticmethod
+    def only(*present):
+        """PATH with exactly these binaries on it."""
+        return unittest.mock.patch.object(
+            toolchain.shutil, "which", lambda b: f"/usr/bin/{b}" if b in present else None)
+
+    def test_a_missing_compiler_stops_the_run_with_the_command_to_install_it(self):
+        with self.only("git", "tmux"), self.assertRaises(util.StepFailed) as e:
+            self.orch("rust-tui").check_toolchain()
+        msg = str(e.exception)
+        self.assertIn("cargo", msg)
+        self.assertIn("rustup.rs", msg)          # the install hint, not just the binary name
+        self.assertIn("--skip-tool-check", msg)
+
+    def test_a_missing_recommended_tool_only_warns(self):
+        with self.only("git", "cargo", "rustc"):
+            self.orch("rust-tui").check_toolchain()          # rustfmt and clippy are missing
+
+    def test_skip_tool_check_runs_anyway_and_says_so_in_the_progress_document(self):
+        o = self.orch("rust-tui", skip_tool_check=True)
+        with self.only("git"):
+            o.check_toolchain()
+        self.assertTrue(any("missing toolchain" in w for w in o.state["run_warnings"]))
+
+    def test_the_generic_profile_needs_nothing_but_git(self):
+        with self.only("git"):
+            self.orch("generic").check_toolchain()
+
+    def test_git_itself_is_required_whatever_the_profile(self):
+        with self.only("cargo", "rustc"), self.assertRaises(util.StepFailed) as e:
+            self.orch("rust-tui").check_toolchain()
+        self.assertIn("git", str(e.exception))
+
+    def test_a_binary_that_is_on_path_but_refuses_to_run_counts_as_missing(self):
+        """`/usr/bin/xcodebuild` ships with the command line tools and errors until Xcode is selected."""
+        failed = subprocess.CompletedProcess([], 1, "", "xcode-select: error: tool 'xcodebuild' requires Xcode")
+        with self.only("git", "swift", "xcodebuild"), \
+                unittest.mock.patch.object(toolchain.subprocess, "run", return_value=failed), \
+                self.assertRaises(util.StepFailed) as e:
+            self.orch("swift-macos").check_toolchain()
+        self.assertIn("requires Xcode", str(e.exception))
+
+    def test_doctor_reports_a_missing_compiler_as_a_failure(self):
+        with self.only("git", "tmux"):
+            lines = dict((msg.split(":")[0], level) for level, msg in toolchain.doctor_lines("rust-tui"))
+        self.assertEqual(lines["tool cargo"], "FAIL")
+        self.assertEqual(lines["tool rustfmt"], "WARN")
+        self.assertEqual(lines["tool git"], "OK")
+
+    def test_every_tool_offers_an_install_hint_on_both_platforms(self):
+        for profile in util.available_profiles():
+            for tool in toolchain.tools_for(profile):
+                for platform in ("darwin", "linux"):
+                    self.assertTrue(tool.install_hint(platform),
+                                    f"{profile}: {tool.name} has no hint for {platform}")
+
+    def test_the_profile_a_started_run_recorded_wins_over_detection(self):
+        Path("Cargo.toml").write_text("[dependencies]\nratatui='0.26'\n")
+        Path(".autodev").mkdir()
+        Path(".autodev/state.json").write_text(json.dumps({"profile": "django-htmx"}))
+        self.assertEqual(autodev.effective_profile(), "django-htmx")
+        self.assertEqual(autodev.effective_profile("swift-ios"), "swift-ios")
 
 
 class ShippedProfileCommands(unittest.TestCase):

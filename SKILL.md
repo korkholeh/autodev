@@ -19,6 +19,11 @@ Run `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py doctor --spec <spec-file>` a
 
 - **FAIL** lines must be fixed before launch (missing spec, git identity, Claude Code not found, a trial headless
   session that returned nothing usable, a missing toolchain for the detected stack profile).
+- **`tool ...` lines** are the toolchain check: git and tmux, plus the compilers and interpreters the detected
+  profile builds with. Each missing one prints the command that installs it on this platform — offer to run it,
+  or hand the user the command. A missing **required** tool (FAIL) also stops `run` itself before the first
+  session; a missing **recommended** one (WARN) only costs a phase some time. `run --skip-tool-check` starts
+  anyway, for a toolchain this check cannot see on PATH.
 - **Existing run** in `.autodev/`: ask whether to resume (default) or start over (`--fresh`). If the doctor says
   the state was not started on this machine, it arrived with the repository — read `.autodev/state.json` with the
   user before offering `--adopt`, since it names the commands the orchestrator will run.

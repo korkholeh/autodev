@@ -44,6 +44,7 @@ from autodev_lib.commands import CMD_CORRECTION, CMD_FIELDS, command_allowed  # 
 from autodev_lib.github import GitHub  # noqa: E402
 from autodev_lib import report  # noqa: E402
 from autodev_lib.staging import COMMAND_FILES, command_change, why_not_committable  # noqa: E402
+from autodev_lib import toolchain  # noqa: E402
 from autodev_lib.usage import RESET_BUFFER_S, UsageGuard  # noqa: E402
 from autodev_lib.util import (AD, GUIDES_DIR, PID_FILE, PROFILES_DIR, STATE_FILE,  # noqa: E402
                               STOP_FILE, SURFACE_LOG, StepFailed, StopRequested, atomic_write,
@@ -125,6 +126,7 @@ DEFAULTS = {
     "max_sessions": 0,       # stop after this many sessions started in this run (0 = no ceiling)
     # stack profile + end-to-end + documentation
     "profile": "",           # name of a file in profiles/ (architect corrects it into .autodev/PROFILE.md)
+    "skip_tool_check": False,  # True = start even when this profile's compilers are missing
     "e2e": "auto",           # auto = run the e2e step on user-facing phases; off = never
     "e2e_cmd": "",           # the end-to-end suite (the e2e step fills it in when empty)
     "e2e_up_cmd": "",        # starts the surfaces the suite attaches to ('-' = nothing to start)
@@ -562,6 +564,7 @@ class Orchestrator:
         (AD / ".gitignore").write_text("logs/\nguides/\nstate.json\nstate.json.tmp\nrun.pid\nSTOP\n"
                                        "autodev.log\nconsole.log\nREPORT.xlsx\nREPORT.csv\n")
         self.install_guides()
+        self.check_toolchain()
         dec = AD / "DECISIONS.md"
         if not dec.exists():
             dec.write_text("# Decisions & assumptions (autonomous run)\n\n"
@@ -673,6 +676,30 @@ class Orchestrator:
         log(f"switched back to the run's branch {branch} (HEAD was on {where})")
         self.record_decision(f"resumed on {where}; checked out the run's branch `{branch}` again "
                              "before committing anything")
+
+    def check_toolchain(self) -> None:
+        """Stop now if the compilers and interpreters this profile builds with are not installed.
+
+        Checked before the first session rather than at the first `cargo build`, because by then a
+        phase has been planned and paid for, and a session that cannot build does not report a
+        missing toolchain — it reports a phase it finished differently."""
+        profile = self.state.get("profile") or self.cfg.get("profile") or detect_profile()
+        results = toolchain.check(profile)
+        for r in results:
+            if r.ok:
+                continue
+            hint = r.tool.install_hint()
+            log(f"WARN toolchain: {r.tool.name} {r.detail} — {r.tool.why}"
+                + (f"; install: {hint}" if hint else ""))
+        gone = toolchain.missing(results, "required")
+        if not gone:
+            return
+        names = ", ".join(r.tool.name for r in gone)
+        if self.cfg.get("skip_tool_check"):
+            self.warn_run(f"missing toolchain ({names}) — running anyway on --skip-tool-check; a phase "
+                          "that cannot build will fail or be worked around")
+            return
+        raise StepFailed(toolchain.preflight_error(results, profile))
 
     def install_guides(self) -> None:
         """Copy the working guides and the chosen stack profile into .autodev/ for the sessions to read.
@@ -2357,6 +2384,24 @@ def cmd_report(args) -> int:
     return 0
 
 
+def effective_profile(explicit: str = "") -> str:
+    """The profile a run would actually use: the flag, then the one a started run recorded, then detection.
+
+    A resumed run keeps the profile it was started with — `.autodev/PROFILE.md` is written once — so
+    the toolchain has to be checked against that one, not against whatever the directory looks like
+    now that a session has filled it with files."""
+    if explicit:
+        return explicit
+    if STATE_FILE.exists():
+        try:
+            recorded = json.loads(STATE_FILE.read_text(encoding="utf-8")).get("profile")
+        except (OSError, ValueError):
+            recorded = ""
+        if recorded:
+            return recorded
+    return detect_profile()
+
+
 def cmd_doctor(args) -> int:
     fails = 0
 
@@ -2443,7 +2488,6 @@ def cmd_doctor(args) -> int:
         rep("INFO", "usage token: read from the login Keychain — the first read on a machine can raise a "
                     "system dialog, which an unattended run cannot answer. Run `doctor` once on the machine "
                     "that will host the run, or set AUTODEV_OAUTH_TOKEN.")
-    rep("OK" if shutil.which("tmux") else "WARN", "tmux " + ("found" if shutil.which("tmux") else "not found"))
     if sys.platform == "darwin":
         rep("OK" if shutil.which("caffeinate") else "WARN", "caffeinate (prevents sleep; keep the lid open/on power)")
     guesses = []
@@ -2461,21 +2505,14 @@ def cmd_doctor(args) -> int:
         guesses.append("cargo test")
     rep("INFO", "test command guess: " + (", ".join(guesses) if guesses else "none")
         + " — the architect step decides, and the run stops if it cannot name one; --test-cmd settles it")
-    prof = getattr(args, "profile", None) or detect_profile()
+    prof = effective_profile(getattr(args, "profile", None))
     known = available_profiles()
     rep("OK" if prof in known else "FAIL",
         f"stack profile: {prof}" + ("" if prof in known else f" — unknown (available: {', '.join(known)})"))
     if Path(".autodev/PROFILE.md").exists():
         rep("INFO", ".autodev/PROFILE.md exists — kept as is; delete it to pick a different profile")
-    if prof in ("django-react", "django-htmx", "fastapi-react"):
-        have = shutil.which("npx") or shutil.which("playwright")
-        rep("OK" if have else "WARN", "browser e2e driver: " + ("available" if have
-            else "no npx/playwright found — phase 1 will have to install it"))
-    if prof.startswith("swift"):
-        rep("OK" if shutil.which("xcodebuild") else "FAIL", "xcodebuild "
-            + ("found" if shutil.which("xcodebuild") else "not found — install Xcode command line tools"))
-    if prof == "rust-tui":
-        rep("OK" if shutil.which("cargo") else "FAIL", "cargo " + ("found" if shutil.which("cargo") else "not found"))
+    for level, msg in toolchain.doctor_lines(prof if prof in known else "generic"):
+        rep(level, msg)
     if Path(".autodev").exists() and git("ls-files", ".autodev", check=False):
         rep("WARN", ".autodev/ is committed to this repository — it names the commands the orchestrator "
                     "runs; state that did not start here is refused unless you pass --adopt")
@@ -2509,6 +2546,8 @@ def main() -> int:
     run.add_argument("--model-review", dest="model_review", help="reviews (default opus)")
     run.add_argument("--model-qa", dest="model_qa", help="end-to-end QA authoring (default sonnet)")
     run.add_argument("--profile", help="stack profile: " + ", ".join(available_profiles()) + " (default: detected)")
+    run.add_argument("--skip-tool-check", dest="skip_tool_check", action="store_const", const=True,
+                     help="start even when a compiler or interpreter this profile needs is not on PATH")
     run.add_argument("--e2e", choices=["auto", "off"], help="end-to-end step on user-facing phases (default auto)")
     run.add_argument("--e2e-cmd", dest="e2e_cmd", help="end-to-end suite command")
     run.add_argument("--e2e-up-cmd", dest="e2e_up_cmd", help="start the surfaces the suite attaches to")

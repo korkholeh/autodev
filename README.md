@@ -19,7 +19,8 @@ brew install tmux                            # so the process survives closing t
 ```
 
 Requirements: Claude Code ≥ 2.1.259 (for `--permission-prompts none`), Python 3.9+, git with `user.email`
-configured, and your stack's toolchain (Xcode, cargo, uv/npm, etc. — `doctor` will check).
+configured, and your stack's toolchain (Xcode, cargo, uv/npm, etc.). Both `doctor` and `run` check it — see
+[Toolchain](#toolchain) below.
 
 ## Running
 
@@ -100,11 +101,38 @@ A profile is a starting sheet: layout, commands (install/build/run/test/lint/e2e
 pitfalls. The architect step corrects it against the real repository and writes it to `.autodev/PROFILE.md` —
 from then on every session reads that file.
 
+## Toolchain
+
+A run is stopped by a missing compiler before it starts, not at 02:00 by a session that then works around it —
+and works around it in writing, as a `[~]` task in `PLAN.md` that reads in the morning like a phase that was
+built. `doctor` and the first seconds of `run` check the same list: git and tmux, plus what the chosen profile
+compiles and tests with.
+
+| Profile | Required | Recommended |
+|---|---|---|
+| all | `git` | `tmux` (the run survives the terminal closing) |
+| `swift-macos` | `swift`, `xcodebuild` | |
+| `swift-ios` | `swift`, `xcodebuild`, `xcrun simctl` | |
+| `rust-tui` | `cargo`, `rustc` | `rustfmt`, `clippy` |
+| `django-htmx` | `python3` | `uv`/`pip`, `ruff`, a browser e2e driver (`npx`) |
+| `django-react`, `fastapi-react` | `python3`, `node`, `npm` | `uv`/`pip`, `ruff`, a browser e2e driver (`npx`) |
+| `generic` | — | the architect step decides the stack; check it by hand |
+
+Each missing tool is reported with the command that installs it on this platform (`brew install tmux`,
+`curl … sh.rustup.rs | sh`, `sudo xcode-select -s /Applications/Xcode.app`, …). A **required** tool that is
+missing fails `doctor` and stops `run`; a **recommended** one is a warning in both. Presence on `PATH` is not
+always enough: `/usr/bin/xcodebuild` ships with the command line tools and errors until a full Xcode is
+selected, so it is asked for its version rather than merely located.
+
+`--skip-tool-check` starts the run anyway — for a toolchain that lives somewhere this check cannot see. The run
+then records the gap as a run warning in `PROGRESS.md`.
+
 ## Flags
 
 | Flag | What it does |
 |---|---|
 | `--profile NAME` | stack profile (auto-detection by default) |
+| `--skip-tool-check` | start even when a compiler or interpreter this profile needs is not on `PATH` |
 | `--test-cmd CMD` | full test-suite command (otherwise the architect picks it) |
 | `--e2e auto\|off` | end-to-end QA on user-facing phases (`auto` by default) |
 | `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`, `--e2e-ready-url` | e2e suite and service lifecycle (the up command must be idempotent and must return) |
@@ -431,7 +459,8 @@ start over with `--fresh`, or read `.autodev/state.json` and accept it deliberat
 - `scripts/autodev_lib/` — the parts that stand on their own: `util.py` (paths, logging, git, helpers),
   `commands.py` (which commands the orchestrator will run, and how a container is fenced in), `staging.py` (what
   must never reach a commit, and which files decide what a command runs), `usage.py` (the limit guard),
-  `github.py` (committing, pushing and the draft PR as one explicit account).
+  `github.py` (committing, pushing and the draft PR as one explicit account), `toolchain.py` (what has to be
+  installed for each profile, and the command that installs it).
 - `tests/test_autodev.py` — 156 tests, stdlib only, nothing leaves the process: no session is started, no network
   call is made. They cover what used to break silently — where a phase goes after each step, which commands the
   orchestrator agrees to run, how a limit is read, when a run stops, and that a resumed run is on its own branch.
