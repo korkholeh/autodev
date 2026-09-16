@@ -285,6 +285,8 @@ python3 ~/.claude/skills/autodev/scripts/autodev.py dash          # q quits
 python3 ~/.claude/skills/autodev/scripts/autodev.py dash --light  # `t` toggles the theme either way
 ```
 
+![The autodev dashboard: agents on the left, phases and their progress in the centre, cost and tokens below](docs/dash.png)
+
 A terminal window onto the run in this directory, refreshed every second, reading the same `state.json` the
 spreadsheet is built from — so it costs no session and nothing it shows can be stale in a way `status` would not be.
 
