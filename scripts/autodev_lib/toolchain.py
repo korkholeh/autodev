@@ -115,6 +115,10 @@ BROWSER_E2E = _t("browser e2e driver", "drives the end-to-end specs; phase 1 has
                  binaries=("npx", "playwright"), level="recommended",
                  hints={"darwin": "`brew install node`, then `npx playwright install`",
                         "linux": "`sudo apt install nodejs npm`, then `npx playwright install`"})
+PYTEST = _t("pytest", "runs the unit, Pilot and snapshot suites", level="recommended",
+            binaries=("pytest", "py.test"),
+            hints={"darwin": "`uv sync` in the project (or `uv tool install pytest`)",
+                   "linux": "`uv sync` in the project (or `uv tool install pytest`)"})
 RUFF = _t("ruff", "the lint and format step of this profile", level="recommended",
           hints={"darwin": "`uv tool install ruff` (or `brew install ruff`)", "linux": "`uv tool install ruff`"})
 SWIFT = _t("swift", "compiles and tests the SwiftPM core the app is built on",
@@ -143,6 +147,7 @@ PROFILE_TOOLS = {
     "django-htmx": [PYTHON, UV_OR_PIP, RUFF, BROWSER_E2E],
     "django-react": [PYTHON, UV_OR_PIP, RUFF, NODE, NPM, BROWSER_E2E],
     "fastapi-react": [PYTHON, UV_OR_PIP, RUFF, NODE, NPM, BROWSER_E2E],
+    "python-textual": [PYTHON, UV_OR_PIP, RUFF, PYTEST],
     "generic": [],
 }
 

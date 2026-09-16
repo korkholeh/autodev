@@ -257,8 +257,11 @@ def detect_profile() -> str:
         spa = Path("frontend").exists() or Path("package.json").exists()
         return "django-react" if spa else "django-htmx"
     py = read("pyproject.toml", "requirements*.txt", "requirements*.in", "*/pyproject.toml", "*/requirements*.txt")
-    if "fastapi" in py.lower():
+    py = py.lower()
+    if "fastapi" in py:
         return "fastapi-react"
+    if "textual" in py:
+        return "python-textual"
     return "generic"
 
 

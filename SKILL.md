@@ -33,8 +33,8 @@ Run `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py doctor --spec <spec-file>` a
   the state was not started on this machine, it arrived with the repository — read `.autodev/state.json` with the
   user before offering `--adopt`, since it names the commands the orchestrator will run.
 - **Usage API unavailable**: tell the user pauses will only trigger on limit events/errors; suggest `AUTODEV_OAUTH_TOKEN`.
-- **Stack profile.** The doctor prints the detected one (`swift-macos`, `swift-ios`, `rust-tui`, `django-htmx`,
-  `django-react`, `fastapi-react`, `generic`). For an empty repository, detection will say `generic` — confirm what is
+- **Stack profile.** The doctor prints the detected one (`swift-macos`, `swift-ios`, `rust-tui`,
+  `python-textual`, `django-htmx`, `django-react`, `fastapi-react`, `generic`). For an empty repository, detection will say `generic` — confirm what is
   being built and pass `--profile <name>`. The profile only seeds `.autodev/PROFILE.md`; the architect step corrects
   it against the real repository.
 

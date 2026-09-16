@@ -5,8 +5,8 @@ by the orchestrator in `scripts/autodev.py`, which runs every step as a separate
 
 A technology-neutral pipeline: architecture → phases → for each phase plan → implementation → tests → review →
 end-to-end (e2e) QA → documentation → commit. Every step is a separate headless Claude Code session with a clean
-context. Works for native Swift apps (macOS, iOS), Rust TUIs, Django+React, FastAPI+React, Django+htmx, and any
-other stack (the `generic` profile).
+context. Works for native Swift apps (macOS, iOS), Rust and Textual TUIs, Django+React, FastAPI+React, Django+htmx,
+and any other stack (the `generic` profile).
 
 **New here?** [`GUIDE.md`](GUIDE.md) explains how a run works, what kind of project it suits, how to write a spec it
 can build from, and how to check the result in the morning. This page is the reference: every flag, every rule.
@@ -99,7 +99,8 @@ Tests, e2e, commits, and state are handled by the script (no usage limit spent).
 ## Stack profiles
 
 `--profile <name>`, auto-detected by default:
-`swift-macos`, `swift-ios`, `rust-tui`, `django-htmx`, `django-react`, `fastapi-react`, `generic`.
+`swift-macos`, `swift-ios`, `rust-tui`, `python-textual`, `django-htmx`, `django-react`, `fastapi-react`,
+`generic`.
 
 A profile is a starting sheet: layout, commands (install/build/run/test/lint/e2e), the e2e driver, common
 pitfalls. The architect step corrects it against the real repository and writes it to `.autodev/PROFILE.md` —
@@ -118,6 +119,7 @@ compiles and tests with.
 | `swift-macos` | `swift`, `xcodebuild` | |
 | `swift-ios` | `swift`, `xcodebuild`, `xcrun simctl` | |
 | `rust-tui` | `cargo`, `rustc` | `rustfmt`, `clippy` |
+| `python-textual` | `python3` | `uv`/`pip`, `ruff`, `pytest` |
 | `django-htmx` | `python3` | `uv`/`pip`, `ruff`, a browser e2e driver (`npx`) |
 | `django-react`, `fastapi-react` | `python3`, `node`, `npm` | `uv`/`pip`, `ruff`, a browser e2e driver (`npx`) |
 | `generic` | — | the architect step decides the stack; check it by hand |

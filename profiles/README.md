@@ -16,6 +16,7 @@ project's record, not a template.
 | `django-htmx.md` | Django with server-rendered templates and htmx |
 | `django-react.md` | Django/DRF backend with a separate React frontend |
 | `fastapi-react.md` | FastAPI backend with a separate React frontend |
+| `python-textual.md` | Terminal application in Python (Textual) |
 
 Choosing: pick by what the spec asks for. If the spec does not say, the developer answers it at intake; if that
 question was never asked, the architect step decides and writes an ADR.

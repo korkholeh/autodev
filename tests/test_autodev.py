@@ -1856,6 +1856,18 @@ class ProfileDetection(TempCwd):
         Path("Cargo.toml").write_text("[dependencies]\nratatui='0.26'\n")
         self.assertEqual(util.detect_profile(), "rust-tui")
 
+    def test_textual_in_the_dependencies_is_a_python_tui(self):
+        Path("pyproject.toml").write_text("[project]\ndependencies = ['textual>=0.80']\n")
+        self.assertEqual(util.detect_profile(), "python-textual")
+
+    def test_a_fastapi_backend_wins_over_a_textual_dependency(self):
+        Path("pyproject.toml").write_text("[project]\ndependencies = ['fastapi', 'textual']\n")
+        self.assertEqual(util.detect_profile(), "fastapi-react")
+
+    def test_python_without_a_known_framework_is_generic(self):
+        Path("pyproject.toml").write_text("[project]\nname = 'x'\n")
+        self.assertEqual(util.detect_profile(), "generic")
+
     def test_django_with_a_frontend_is_the_spa_profile(self):
         Path("manage.py").write_text("")
         Path("package.json").write_text("{}")
@@ -1902,6 +1914,13 @@ class Toolchain(TempCwd):
         with self.only("git"):
             o.check_toolchain()
         self.assertTrue(any("missing toolchain" in w for w in o.state["run_warnings"]))
+
+    def test_a_textual_run_needs_python_and_only_warns_about_the_rest(self):
+        with self.only("git", "python3"):
+            self.orch("python-textual").check_toolchain()     # uv, ruff and pytest are recommended
+        with self.only("git", "tmux"), self.assertRaises(util.StepFailed) as e:
+            self.orch("python-textual").check_toolchain()
+        self.assertIn("python3", str(e.exception))
 
     def test_the_generic_profile_needs_nothing_but_git(self):
         with self.only("git"):
