@@ -33,7 +33,7 @@ autodev = importlib.util.module_from_spec(_spec)
 sys.modules["autodev"] = autodev
 _spec.loader.exec_module(autodev)                 # this also puts scripts/ on sys.path
 
-from autodev_lib import commands, report, staging, toolchain, usage, util   # noqa: E402  (enabled by the entry point)
+from autodev_lib import bootstrap, commands, dashdata, report, staging, toolchain, usage, util   # noqa: E402  (enabled by the entry point)
 
 
 class TempCwd(unittest.TestCase):
@@ -2760,6 +2760,353 @@ class SkillLayout(unittest.TestCase):
         self.assertTrue(referenced)
         for guide in sorted(referenced):
             self.assertTrue((util.GUIDES_DIR / guide).is_file(), f"guides/{guide} is referenced but missing")
+
+
+
+
+# --------------------------------------------------------------------------- dashboard numbers
+HAS_TEXTUAL = importlib.util.find_spec("textual") is not None
+
+
+def dash_state(**over) -> dict:
+    """A run halfway through its second phase, with two finished sessions behind it."""
+    created = datetime.fromtimestamp(time.time() - 3600).strftime("%Y-%m-%d %H:%M:%S")
+    state = {
+        "created": created, "status": "running", "step": "test_fix", "phase_index": 1,
+        "branch": "autodev/x", "spec": "spec.md", "project": {"name": "Demo"},
+        "phases": [
+            {"title": "One", "slug": "one", "status": "done", "commit": "abcdef1234", "user_facing": False},
+            {"title": "Two", "slug": "two", "status": "in_progress", "user_facing": True,
+             "warnings": ["a warning"]},
+            {"title": "Three", "slug": "three", "status": "pending", "user_facing": True},
+        ],
+        "sessions": [
+            {"n": 1, "label": "p01-implement", "model": "sonnet", "sec": 600, "turns": 9, "cost": 1.0,
+             "error": "", "in": 10, "cache_w": 20, "cache_r": 30, "out": 40, "think": 0},
+            {"n": 2, "label": "p02-test", "model": "opus", "sec": 300, "turns": 4, "cost": 2.0,
+             "error": "boom", "in": 1, "cache_w": 2, "cache_r": 3, "out": 4, "think": 5},
+        ],
+        "session_counter": 3, "active_session": None, "events": [],
+        "totals": {"sessions": 2, "seconds": 900, "cost_usd": 3.0, "paused": 600, "models": {}},
+    }
+    state.update(over)
+    return state
+
+
+class DashboardNumbers(unittest.TestCase):
+    def test_a_fix_step_does_not_advance_the_phase(self):
+        """`test_fix` is the phase going round the test step again, not progress past it."""
+        ph = {"status": "in_progress"}
+        at_test = dashdata.phase_progress(ph, True, "test")
+        self.assertEqual(at_test, dashdata.phase_progress(ph, True, "test_fix"))
+        self.assertEqual(at_test, dashdata.phase_progress(ph, True, "review_fix") - 1 / 7)
+
+    def test_a_finished_phase_is_complete_whatever_the_step_says(self):
+        self.assertEqual(dashdata.phase_progress({"status": "done"}, True, "plan"), 1.0)
+
+    def test_a_phase_that_is_not_the_current_one_has_not_started(self):
+        self.assertEqual(dashdata.phase_progress({"status": "pending"}, False, "review"), 0.0)
+
+    def test_phases_carry_what_their_own_sessions_cost(self):
+        rows = dashdata.phases(dash_state())
+        self.assertEqual([p.n for p in rows], [1, 2, 3])
+        self.assertEqual(rows[0].cost, 1.0)
+        self.assertEqual(rows[1].seconds, 300)
+        self.assertEqual(rows[1].step, "test_fix")
+        self.assertEqual(rows[2].sessions, 0)
+        self.assertEqual(rows[0].commit, "abcdef12")
+        self.assertFalse(rows[0].user_facing)
+
+    def test_overall_progress_averages_the_phases(self):
+        # one done, one at the tests (2/7), one untouched
+        self.assertAlmostEqual(dashdata.overall_progress(dash_state()), (1 + 2 / 7) / 3)
+
+    def test_a_run_without_a_roadmap_yet_has_barely_started(self):
+        self.assertEqual(dashdata.overall_progress({"step": "architect", "phases": []}), 0.0)
+        self.assertGreater(dashdata.overall_progress({"step": "roadmap", "phases": []}), 0.0)
+
+    def test_the_estimate_comes_from_the_phases_that_finished(self):
+        eta = dashdata.eta_seconds(dash_state())
+        # phase one took 600s; phase two is 2/7 done, phase three untouched
+        self.assertAlmostEqual(eta, 600 * (1 - 2 / 7) + 600)
+
+    def test_nothing_is_estimated_before_the_first_phase_lands(self):
+        st = dash_state()
+        st["phases"][0]["status"] = "in_progress"
+        self.assertIsNone(dashdata.eta_seconds(st))
+
+    def test_the_live_session_is_the_first_agent_and_is_timed(self):
+        started = datetime.fromtimestamp(time.time() - 120).strftime("%Y-%m-%d %H:%M:%S")
+        st = dash_state(active_session={"label": "p02-test_fix", "model": "sonnet", "started": started,
+                                        "session_id": "s1"})
+        rows = dashdata.agents(st)
+        self.assertEqual(rows[0].state, "running")
+        self.assertEqual(rows[0].step, "test_fix")
+        self.assertEqual(rows[0].phase, "phase 2")
+        self.assertAlmostEqual(rows[0].seconds, 120, delta=5)
+        self.assertEqual([r.n for r in rows[1:]], [2, 1])        # newest finished session first
+        self.assertEqual(rows[1].state, "error")
+
+    def test_models_are_rebuilt_from_the_sessions_of_an_older_run(self):
+        models = dashdata.models(dash_state())
+        self.assertEqual([m.name for m in models], ["opus", "sonnet"])     # dearest first
+        self.assertEqual(models[0].cost, 2.0)
+        self.assertEqual(models[1].total, 100)
+
+    def test_recorded_model_totals_are_used_when_the_run_kept_them(self):
+        st = dash_state()
+        st["totals"]["models"] = {"sonnet": {"sessions": 7, "cost": 9.0, "in": 5}}
+        models = dashdata.models(st)
+        self.assertEqual([(m.name, m.sessions, m.cost, m.total) for m in models], [("sonnet", 7, 9.0, 5)])
+
+    def test_tokens_are_summed_by_kind(self):
+        self.assertEqual(dashdata.tokens(dash_state()),
+                         {"in": 11, "cache_w": 22, "cache_r": 33, "out": 44, "think": 5, "total": 115})
+
+    def test_the_clock_splits_the_night_into_working_paused_and_nobody_running(self):
+        c = dashdata.clock(dash_state(), now=time.time())
+        self.assertAlmostEqual(c.wall, 3600, delta=5)
+        self.assertEqual((c.working, c.paused), (900, 600))
+        self.assertAlmostEqual(c.idle, 3600 - 1500, delta=5)
+
+    def test_an_empty_state_does_not_throw(self):
+        for fn in (dashdata.phases, dashdata.agents, dashdata.models, dashdata.tokens,
+                   dashdata.overall_progress, dashdata.eta_seconds, dashdata.clock, dashdata.head):
+            fn({})
+
+    def test_a_bar_is_drawn_in_eighths(self):
+        self.assertEqual(dashdata.bar(1.0, 4), "████")
+        self.assertEqual(dashdata.bar(0.0, 4), "")
+        self.assertEqual(len(dashdata.bar(2.0, 4)), 4)           # clamped, never wider than asked
+        self.assertNotEqual(dashdata.bar(0.05, 4), dashdata.bar(0.2, 4))
+
+
+class DashboardControls(TempCwd):
+    def test_the_headline_knows_a_stop_was_asked_for_but_not_yet_taken(self):
+        autodev.AD.mkdir()
+        (autodev.AD / "run.pid").write_text(str(os.getpid()))
+        h = dashdata.head(dash_state())
+        self.assertTrue(h.alive)
+        self.assertFalse(h.stopping)
+        (autodev.AD / "STOP").touch()
+        self.assertTrue(dashdata.head(dash_state()).stopping)
+
+    def test_a_dead_pid_reads_as_no_process(self):
+        autodev.AD.mkdir()
+        (autodev.AD / "run.pid").write_text("999999")
+        self.assertFalse(dashdata.head(dash_state()).alive)
+
+    @unittest.skipUnless(HAS_TEXTUAL, "the dashboard needs textual")
+    def test_resume_clears_a_stop_left_over_from_the_last_one(self):
+        """An uncleared STOP file would stop the new run within seconds of it starting."""
+        from autodev_lib import dash                       # needs textual; skipped when absent
+        autodev.AD.mkdir()
+        (autodev.AD / "STOP").touch()
+        started = []
+        with unittest.mock.patch.object(dash.shutil, "which", return_value="/usr/bin/tmux"), \
+             unittest.mock.patch.object(dash.subprocess, "run",
+                                        side_effect=lambda cmd, **kw: started.append(cmd)):
+            note = dash.resume_run()
+        self.assertFalse((autodev.AD / "STOP").exists())
+        self.assertIn("tmux", note)
+        self.assertEqual(started[0][:3], ["tmux", "new-session", "-d"])
+
+    @unittest.skipUnless(HAS_TEXTUAL, "the dashboard needs textual")
+    def test_resume_does_nothing_while_the_run_is_alive(self):
+        from autodev_lib import dash
+        autodev.AD.mkdir()
+        (autodev.AD / "run.pid").write_text(str(os.getpid()))
+        with unittest.mock.patch.object(dash.subprocess, "Popen") as popen:
+            self.assertEqual(dash.resume_run(), "already running")
+        popen.assert_not_called()
+
+    def test_the_log_is_tailed_from_the_end(self):
+        autodev.AD.mkdir()
+        (autodev.AD / "autodev.log").write_text("\n".join(f"line {i}" for i in range(5000)))
+        tail = dashdata.log_tail(lines=10)
+        self.assertEqual(tail[-1], "line 4999")
+        self.assertLessEqual(len(tail), 10)
+
+    def test_dash_without_a_run_says_so(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = autodev.cmd_dash(argparse.Namespace(light=False))
+        self.assertEqual(rc, 1)
+        self.assertIn("no autodev run", out.getvalue())
+
+
+
+# --------------------------------------------------------------------------- the tooling venv
+class ToolingVenv(unittest.TestCase):
+    """`dash` and `report` may install what they need. Nothing on the run's path may."""
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        for k in ("AUTODEV_VENV", "AUTODEV_NO_BOOTSTRAP", "XDG_DATA_HOME", bootstrap.REEXEC_MARK):
+            os.environ.pop(k, None)
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._tmp.cleanup()
+
+    def test_the_venv_lives_outside_every_project(self):
+        home = bootstrap.tool_venv()
+        self.assertNotIn(str(Path.cwd()), str(home))
+        os.environ["XDG_DATA_HOME"] = "/data"
+        self.assertEqual(bootstrap.tool_venv(), Path("/data/autodev/venv"))
+        os.environ["AUTODEV_VENV"] = self._tmp.name
+        self.assertEqual(bootstrap.tool_venv(), Path(self._tmp.name))
+
+    def test_a_module_that_is_already_here_is_left_alone(self):
+        with unittest.mock.patch.object(bootstrap, "reexec") as jump:
+            self.assertEqual(bootstrap.ensure("json", "for the test", "yes"), "present")
+        jump.assert_not_called()
+
+    def test_nothing_is_installed_when_the_command_says_not_to(self):
+        os.environ["AUTODEV_VENV"] = self._tmp.name
+        with unittest.mock.patch.object(bootstrap, "pip_install") as pip:
+            self.assertEqual(bootstrap.ensure("nosuchmodule", "for the test", "no"), "unavailable")
+        pip.assert_not_called()
+
+    def test_the_environment_can_forbid_it_for_every_command(self):
+        os.environ["AUTODEV_NO_BOOTSTRAP"] = "1"
+        with unittest.mock.patch.object(bootstrap, "pip_install") as pip:
+            self.assertEqual(bootstrap.ensure("nosuchmodule", "for the test", "ask"), "unavailable")
+        pip.assert_not_called()
+
+    def test_it_asks_before_installing_and_a_no_is_final(self):
+        os.environ["AUTODEV_VENV"] = self._tmp.name
+        asked = []
+        with unittest.mock.patch.object(bootstrap, "pip_install") as pip:
+            out = bootstrap.ensure("nosuchmodule", "for the test", "ask",
+                                   ask=lambda q: asked.append(q) or False)
+        self.assertEqual(out, "declined")
+        self.assertEqual(len(asked), 1)
+        self.assertIn(self._tmp.name, asked[0])
+        pip.assert_not_called()
+
+    def test_a_yes_builds_the_venv_installs_and_comes_back_in_it(self):
+        root = Path(self._tmp.name) / "venv"
+        os.environ["AUTODEV_VENV"] = str(root)
+        order = []
+        with unittest.mock.patch.object(bootstrap, "create_venv", side_effect=lambda r: order.append(("venv", r)) or ""), \
+             unittest.mock.patch.object(bootstrap, "pip_install", side_effect=lambda py, pkg: order.append(("pip", pkg)) or ""), \
+             unittest.mock.patch.object(bootstrap, "reexec", side_effect=lambda py: order.append(("exec", py))):
+            bootstrap.ensure("nosuchmodule", "for the test", "yes")
+        self.assertEqual([step for step, _ in order], ["venv", "pip", "exec"])
+        self.assertEqual(order[1][1], "nosuchmodule")
+
+    def test_an_existing_venv_is_reused_without_asking_again(self):
+        os.environ["AUTODEV_VENV"] = self._tmp.name
+        bootstrap.venv_python().parent.mkdir(parents=True, exist_ok=True)
+        bootstrap.venv_python().touch()
+        with unittest.mock.patch.object(bootstrap, "module_in", return_value=True), \
+             unittest.mock.patch.object(bootstrap, "reexec") as jump, \
+             unittest.mock.patch.object(bootstrap, "pip_install") as pip:
+            bootstrap.ensure("nosuchmodule", "for the test", "ask", ask=lambda q: self.fail("asked anyway"))
+        jump.assert_called_once()
+        pip.assert_not_called()
+
+    def test_an_install_that_failed_is_reported_not_retried(self):
+        os.environ["AUTODEV_VENV"] = str(Path(self._tmp.name) / "venv")
+        with unittest.mock.patch.object(bootstrap, "create_venv", return_value=""), \
+             unittest.mock.patch.object(bootstrap, "pip_install", return_value="could not install textual: no network"), \
+             unittest.mock.patch.object(bootstrap, "reexec") as jump:
+            out = bootstrap.ensure("nosuchmodule", "for the test", "yes")
+        self.assertIn("no network", out)
+        jump.assert_not_called()
+        self.assertIn("pip install textual", bootstrap.advice("textual", out))
+
+    def test_it_gives_up_rather_than_start_itself_forever(self):
+        """The re-exec carries a marker, so a broken install ends in a message, not a loop."""
+        os.environ[bootstrap.REEXEC_MARK] = "1"
+        with unittest.mock.patch.object(bootstrap, "pip_install") as pip:
+            out = bootstrap.ensure("nosuchmodule", "for the test", "yes")
+        self.assertIn("still not importable", out)
+        pip.assert_not_called()
+
+    def test_a_pipe_is_never_asked(self):
+        with unittest.mock.patch.object(bootstrap.sys, "stdin", io.StringIO("y\n")):
+            self.assertFalse(bootstrap._confirm("install? "))
+
+    def test_the_run_itself_never_reaches_for_this(self):
+        """A phase that stopped at 3am to install a package is the failure this project avoids."""
+        source = (ROOT / "scripts" / "autodev.py").read_text()
+        run_path = source[source.index("class Orchestrator"):source.index("def new_state")]
+        self.assertNotIn("bootstrap.", run_path)
+        self.assertIn("bootstrap.ensure", source)        # the CLI commands do use it
+
+
+
+@unittest.skipUnless(HAS_TEXTUAL, "the dashboard needs textual")
+class DashboardScrolling(TempCwd):
+    """Reading the sessions must survive the refresh that happens under you every second."""
+
+    def run_app(self, steps):
+        import asyncio
+        from autodev_lib.dash import Dashboard
+
+        async def main():
+            app = Dashboard()
+            async with app.run_test(size=(140, 24)) as pilot:
+                await pilot.pause()
+                await steps(app, pilot)
+        asyncio.run(main())
+
+    def setUp(self):
+        super().setUp()
+        autodev.AD.mkdir()
+        state = dash_state()
+        row = state["sessions"][0]
+        state["sessions"] = [dict(row, n=i + 1) for i in range(60)]
+        state["active_session"] = {"label": "p02-test_fix", "model": "sonnet", "session_id": "s1",
+                                   "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        self.state = state
+        autodev.STATE_FILE.write_text(json.dumps(state))
+
+    def test_a_tick_does_not_throw_the_reader_back_to_the_top(self):
+        from textual.widgets import DataTable
+
+        async def steps(app, pilot):
+            table = app.query_one("#agents", DataTable)
+            table.scroll_to(y=12, animate=False, force=True)
+            await pilot.pause()
+            for _ in range(3):
+                app.tick()
+                await pilot.pause()
+            self.assertEqual(table.scroll_offset.y, 12)
+        self.run_app(steps)
+
+    def test_a_new_session_rebuilds_the_list_and_keeps_your_place(self):
+        from textual.widgets import DataTable
+
+        async def steps(app, pilot):
+            table = app.query_one("#agents", DataTable)
+            table.scroll_to(y=12, animate=False, force=True)
+            await pilot.pause()
+            before = table.row_count
+            self.state["sessions"].append(dict(self.state["sessions"][-1], n=999, label="p03-plan"))
+            autodev.STATE_FILE.write_text(json.dumps(self.state))
+            app.stamp = -1.0                     # what a changed mtime does
+            app.tick()
+            await pilot.pause()
+            self.assertEqual(table.row_count, before + 1)
+            self.assertEqual(table.scroll_offset.y, 12)
+        self.run_app(steps)
+
+    def test_only_the_running_clock_is_written_while_nothing_else_moves(self):
+        """Most ticks change one cell, not the table — that is what keeps the scroll still."""
+        from textual.widgets import DataTable
+
+        async def steps(app, pilot):
+            table = app.query_one("#agents", DataTable)
+            with unittest.mock.patch.object(DataTable, "clear", side_effect=AssertionError("rebuilt")):
+                app.tick()
+                await pilot.pause()
+            self.assertEqual(table.row_count, 61)          # 60 finished sessions and the live one
+        self.run_app(steps)
 
 
 if __name__ == "__main__":

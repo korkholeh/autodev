@@ -99,7 +99,8 @@ Print the command for the user to run in their own terminal instead:
 
 ## 3. Hand-off message (short)
 
-- Watch: `tmux attach -t autodev-<repo>` (detach: Ctrl-b d) · `tail -f .autodev/autodev.log`
+- Watch: `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py dash` (live dashboard; it offers to install what it needs) ·
+  `tmux attach -t autodev-<repo>` (detach: Ctrl-b d) · `tail -f .autodev/autodev.log`
 - Status: `python3 ${CLAUDE_SKILL_DIR}/scripts/autodev.py status`
 - Morning, in this order: `.autodev/HANDOFF.md`, `.autodev/PROGRESS.md`, `.autodev/DECISIONS.md`,
   `docs/user/`, `git log --oneline` on the `autodev/…` branch (or, with `--pr`, the stack of draft PRs — one per phase)

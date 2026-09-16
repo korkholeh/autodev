@@ -18,6 +18,10 @@ unzip autodev.zip -d ~/.claude/skills/      # → ~/.claude/skills/autodev/SKILL
 brew install tmux                            # so the process survives closing the terminal
 ```
 
+`dash` and `report` want one package each — `textual` and `openpyxl`. Neither is needed to install
+autodev or to run it: the first time you use one of those two commands it offers to set them up
+(see [The tooling venv](#the-tooling-venv)).
+
 Requirements: Claude Code ≥ 2.1.259 (for `--permission-prompts none`), Python 3.9+, git with `user.email`
 configured, and your stack's toolchain (Xcode, cargo, uv/npm, etc.). Both `doctor` and `run` check it — see
 [Toolchain](#toolchain) below.
@@ -250,7 +254,8 @@ one is based on, which would turn the rest of the stack into conflicts against h
 
 ## Control
 
-- status: `autodev.py status` · log: `tail -f .autodev/autodev.log` · e2e services: `.autodev/logs/e2e-surfaces.log`
+- status: `autodev.py status` · live dashboard: `autodev.py dash` · log: `tail -f .autodev/autodev.log` ·
+  e2e services: `.autodev/logs/e2e-surfaces.log`
 - stop after the current session: `touch .autodev/STOP` · immediately: Ctrl-C (the session will be resumed on the
   next `run`; a second Ctrl-C kills the session's whole process group, so the tests and dev servers it started go
   with it). The resume handle is written to `state.json` as soon as a session names itself, so even a power cut
@@ -270,6 +275,56 @@ one is based on, which would turn the rest of the stack into conflicts against h
 - a resumed run puts itself back on its own branch first: if you left the repository on another branch (or on a
   detached HEAD) it checks the run's branch out again, and if there are uncommitted changes that are not the
   run's, it stops and leaves them alone
+
+## The dashboard
+
+```bash
+python3 ~/.claude/skills/autodev/scripts/autodev.py dash          # q quits
+python3 ~/.claude/skills/autodev/scripts/autodev.py dash --light  # `t` toggles the theme either way
+```
+
+A terminal window onto the run in this directory, refreshed every second, reading the same `state.json` the
+spreadsheet is built from — so it costs no session and nothing it shows can be stale in a way `status` would not be.
+
+| Where | What |
+|---|---|
+| top left | **Stop** writes `.autodev/STOP` (the run ends after the session it is in) · **Resume** starts the orchestrator again, in tmux when there is tmux · **Log** opens `.autodev/autodev.log`, tailed |
+| top right | run status, whether a process is actually alive, the current step and phase, the branch, and `resumes ≈` while a usage limit is being waited out |
+| left | every session the run has started, newest first, the live one on top with its clock running: step, model, time, cost |
+| centre | the phases, each with its own progress bar — the fix steps do not advance it, so a phase that fails its suite three times keeps reading as "at the tests" — plus sessions, time, cost and commit per phase |
+| bottom centre | cost and tokens per model, tokens by kind, the night split into working / paused on the limit / nobody running, the total cost and what a phase has averaged |
+| bottom | overall progress across the phases, and an estimate of the time left taken from what the finished phases actually took |
+
+Keys: `s` stop · `r` resume (it asks first — resuming spends usage and writes commits) · `l` log · `a` agents
+· `t` theme · `q` quit. The sidebar hides itself below 96 columns; `a` brings it back.
+
+It needs `textual`; the first run offers to install it. Declined, the command says what to run and exits —
+`status` and `REPORT.xlsx` answer the same questions, less prettily, and a run never depends on the dashboard
+being installable.
+
+### The tooling venv
+
+Everything a run does is stdlib, deliberately: the orchestrator has to start at 3am on whatever `python3` is
+there. Only the two things you look at afterwards want a package. So the first time you run `dash` (or `report`
+without `openpyxl`) it asks:
+
+```
+textual is needed to draw the dashboard.
+Install it into ~/.local/share/autodev/venv (nothing is added to this project)? [Y/n]
+```
+
+Yes builds one venv of its own — outside every project, shared by all of them — installs the package there, and
+starts the same command again in it. Nothing is added to your project's environment, and you do not have to
+remember which interpreter has what.
+
+- `--install` says yes without asking (for a script or a first run you already decided about); `--no-install`
+  never installs and prints the command that would.
+- `AUTODEV_NO_BOOTSTRAP=1` forbids it for every command; `AUTODEV_VENV=/path` puts the venv somewhere else.
+- **A run never does this.** No phase, no step and no report written by the orchestrator can install anything:
+  a phase that stopped at 3am to install a package, or waited on a network that was not there, is the failure
+  this project exists to avoid. `.autodev/REPORT.xlsx` stays a CSV until you ask for the workbook yourself.
+- One attempt only — the restart carries a marker, so a broken install ends in a message and not in a process
+  that starts itself forever.
 
 ## Usage limits
 
@@ -468,8 +523,11 @@ start over with `--fresh`, or read `.autodev/state.json` and accept it deliberat
   `commands.py` (which commands the orchestrator will run, and how a container is fenced in), `staging.py` (what
   must never reach a commit, and which files decide what a command runs), `usage.py` (the limit guard),
   `github.py` (committing, pushing and the draft PR as one explicit account), `toolchain.py` (what has to be
-  installed for each profile, and the command that installs it).
-- `tests/test_autodev.py` — 156 tests, stdlib only, nothing leaves the process: no session is started, no network
+  installed for each profile, and the command that installs it), `bootstrap.py` (the tooling venv `dash` and
+  `report` may build for themselves — and that no run ever touches), `dashdata.py` (what the dashboard draws, derived
+  from `state.json`) and `dash.py` (the dashboard itself — the only module that needs a package outside the
+  stdlib, and the only one a run works without).
+- `tests/test_autodev.py` — 314 tests, stdlib only, nothing leaves the process: no session is started, no network
   call is made. They cover what used to break silently — where a phase goes after each step, which commands the
   orchestrator agrees to run, how a limit is read, when a run stops, and that a resumed run is on its own branch.
   Run them with `python3 -m unittest discover -s tests` from the repository root; a change to the phase machine

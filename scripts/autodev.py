@@ -42,6 +42,7 @@ if str(_HERE) not in sys.path:              # so autodev_lib imports whether run
 
 from autodev_lib.commands import CMD_CORRECTION, CMD_FIELDS, command_allowed  # noqa: E402
 from autodev_lib.github import GitHub  # noqa: E402
+from autodev_lib import bootstrap  # noqa: E402
 from autodev_lib import report  # noqa: E402
 from autodev_lib.staging import COMMAND_FILES, command_change, why_not_committable  # noqa: E402
 from autodev_lib import toolchain  # noqa: E402
@@ -929,9 +930,23 @@ class Orchestrator:
         written with it because a label can change between the interrupt and the restart — a review
         interrupted as `p04-review1` came back as `p04-review2`, which matched nothing, so 95 seconds
         of an opus review were paid for and thrown away."""
-        self.state["active_session"] = {"label": label, "session_id": session_id,
+        act = self.state.get("active_session") or {}
+        self.state["active_session"] = {**act, "label": label, "session_id": session_id,
                                         "step": self.state.get("step"),
                                         "phase_index": self.state.get("phase_index")}
+        self.save()
+
+    def begin_session(self, label: str, model: str, resume: str) -> None:
+        """Mark a session as live before it has a handle, so a watcher can see it and time it.
+
+        Whatever handle the last attempt left is carried over rather than overwritten: `resume_handle`
+        may still need it, and a session already paid for must not be lost to a display field."""
+        st, act = self.state, self.state.get("active_session") or {}
+        matches = act.get("label") == label or (act.get("step") == st.get("step")
+                                                and act.get("phase_index") == st.get("phase_index"))
+        st["active_session"] = {"label": label, "session_id": resume or (act.get("session_id") if matches else "") or "",
+                                "step": st.get("step"), "phase_index": st.get("phase_index"),
+                                "model": model, "started": ts()}
         self.save()
 
     def resume_handle(self, label: str) -> str:
@@ -955,6 +970,7 @@ class Orchestrator:
         out = {"session_id": resume, "result": None, "interrupted": None, "rejected": False,
                "exit": None, "budget": "", "context": 0, "stderr": ""}
         started = time.time()
+        self.begin_session(label, model, resume or "")
         log(f"▶ {label} [{model}]" + (f" resume {resume[:8]}" if resume else ""))
         with open(f"{base}.jsonl", "a", encoding="utf-8") as jf, open(f"{base}.stderr.log", "a") as ef:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL, text=True,
@@ -2434,6 +2450,12 @@ def cmd_report(args) -> int:
         print("no autodev run in this directory")
         return 1
     state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    # Only here, never on the run's path: the orchestrator writes this after every phase, and a
+    # phase that stopped at 3am to install a package is the failure this project exists to avoid.
+    outcome = bootstrap.ensure("openpyxl", "to write the workbook (without it the numbers land in a CSV)",
+                               install_mode(args))
+    if outcome not in ("present", "declined"):
+        print(bootstrap.advice("openpyxl", outcome))
     path, note = report.write(state, Path(args.out) if args.out else AD / "REPORT.xlsx", AD / "logs")
     if note:
         print(note)
@@ -2442,6 +2464,30 @@ def cmd_report(args) -> int:
         return 1
     print(path.as_posix())
     return 0
+
+
+def install_mode(args) -> str:
+    """"ask" unless the command was told what to do about a missing package."""
+    if getattr(args, "no_install", False):
+        return "no"
+    return "yes" if getattr(args, "install", False) else "ask"
+
+
+def cmd_dash(args) -> int:
+    """The live dashboard. `textual` is optional, so its absence is a question, not a crash."""
+    if not STATE_FILE.exists():
+        print("no autodev run in this directory")
+        return 1
+    if not sys.stdout.isatty():
+        print("dash draws a terminal UI — run it in a terminal (`status` prints the same run, plainly)")
+        return 1
+    outcome = bootstrap.ensure("textual", "to draw the dashboard", install_mode(args))
+    if outcome != "present":
+        print("the dashboard needs textual:", bootstrap.advice("textual", outcome))
+        print("`status` and `REPORT.xlsx` show the same numbers without it")
+        return 1
+    from autodev_lib import dash
+    return dash.main(light=bool(getattr(args, "light", False)))
 
 
 def effective_profile(explicit: str = "") -> str:
@@ -2705,9 +2751,19 @@ def main() -> int:
     stat = sub.add_parser("status", help="show run status")
     stat.set_defaults(func=cmd_status)
 
+    dash_p = sub.add_parser("dash", help="live dashboard for the run in this directory (needs textual)")
+    dash_p.add_argument("--light", action="store_true", help="start in the light theme (`t` toggles it)")
+    dash_p.set_defaults(func=cmd_dash)
+
     rep = sub.add_parser("report", help="write .autodev/REPORT.xlsx from the run state")
     rep.add_argument("--out", help="where to write it (default .autodev/REPORT.xlsx)")
     rep.set_defaults(func=cmd_report)
+
+    for sub_parser in (dash_p, rep):        # what to do about a package these two commands need
+        sub_parser.add_argument("--install", action="store_true",
+                                help="install what is missing into the autodev venv without asking")
+        sub_parser.add_argument("--no-install", action="store_true", dest="no_install",
+                                help="never install anything; say what to run instead")
 
     args = ap.parse_args()
     return args.func(args)

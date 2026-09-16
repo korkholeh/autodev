@@ -159,6 +159,7 @@ architect ─► roadmap ─► for each phase:
 While it runs:
 
 ```bash
+python3 ~/.claude/skills/autodev/scripts/autodev.py dash     # live dashboard: phases, agents, cost
 python3 ~/.claude/skills/autodev/scripts/autodev.py status   # where it is, last 8 events
 python3 ~/.claude/skills/autodev/scripts/autodev.py report   # rebuild .autodev/REPORT.xlsx now
 tail -f .autodev/autodev.log                                 # live
