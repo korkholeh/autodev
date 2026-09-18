@@ -55,6 +55,9 @@ This is the last human input of the run. Everything unasked becomes a logged gue
   already-running surface has to succeed, not fail on a taken port — and it must **return** once the surfaces are up.
   A command that stays in the foreground only works together with `--e2e-ready-url`. Left empty, the architect and
   e2e steps work them out and write them down. `--e2e off` turns the end-to-end layer off entirely.
+- Each user-facing phase ends with a screenshot session that photographs the product into
+  `.autodev/phases/NN-*/screenshots/` and captions it in `SCREENS.md`, so the morning starts by looking
+  rather than reading. It costs one small session per phase; `--screens off` skips it.
 - **Commands the sessions propose are vetted** against a toolchain allowlist before the orchestrator runs them; a
   session that proposes something else is told why and corrects it once. If this project drives its suite through
   its own script, pass `--allow-cmd <binary>` (or just pass the command yourself, which is never checked).

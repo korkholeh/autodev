@@ -28,6 +28,7 @@ plus a pure render from state to a frame.** Keep every terminal call in `main.rs
 | e2e up | `-` |
 | e2e | `cargo test --test e2e -- --test-threads=1` |
 | e2e down | `-` |
+| screenshot | `vhs <tape>` (tape drives the keys, writes PNG/GIF), or dump the parsed pty screen to `.txt` |
 
 ## Testing layers
 
@@ -61,3 +62,12 @@ confirmation. Also state where config and data files live and what happens when 
 - Blocking I/O in the event loop freezes the UI; long work goes on a thread or a task with a progress state.
 - Panics must restore the terminal — install a panic hook that tears down before printing.
 - Colour and unicode are not universal: check behaviour with a 16-colour terminal and with `NO_COLOR` set.
+
+## Screenshots
+
+- `vhs` is the capture worth having: the tape drives real keystrokes and writes a PNG (or a short GIF) at a size
+  you fix in the tape.
+- Without `vhs`, run the binary under a pty, parse the screen and write it as `.txt` with ANSI stripped — a text
+  frame beats no frame, and it diffs well.
+- Fix `TERM` and the terminal size, and let colours be whatever the product's defaults are.
+- Wait for the expected string on screen before capturing; a fixed sleep photographs a redraw.

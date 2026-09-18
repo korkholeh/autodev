@@ -83,6 +83,7 @@ class PhaseHarness:
             "review_audit": {"verdict": "approve", "summary": "", "findings": []},
             "e2e": {"status": "done", "summary": ""},
             "e2e_fix": {"status": "done", "summary": ""},
+            "screens": lambda h: h.capture_screens(),
             "docs": {"status": "done", "summary": ""},
         }
         self.tests_ok = [True] * 50          # consumed one per run_tests call
@@ -90,6 +91,7 @@ class PhaseHarness:
         self.status = []                     # consumed one per `git status --porcelain` call
         self.e2e_ok = [True] * 50
         self.plan_tasks = "- [x] T1: done\n"
+        self.shots = [("01-empty-state.png", "the app with nothing in it")]   # what screens captures
         self.changed_files = "src/app.py\nREADME.md\n"
         self.surfaces_start = True
 
@@ -130,6 +132,17 @@ class PhaseHarness:
         value = self.returns[step]
         return dict(value(self) if callable(value) else value)
 
+    def capture_screens(self):
+        """Write the frames a screenshot session would have captured, and report them."""
+        pdir = self.o.phase_dir(self.state["phase_index"])
+        (pdir / "screenshots").mkdir(parents=True, exist_ok=True)
+        claimed = []
+        for name, caption in self.shots:
+            path = pdir / "screenshots" / name
+            path.write_bytes(b"\x89PNG\r\n" + b"x" * 64)
+            claimed.append({"file": path.as_posix(), "caption": caption})
+        return {"status": "done", "summary": "", "screenshots": claimed}
+
     def _run_tests(self, pdir):
         ok = self.tests_ok.pop(0) if self.tests_ok else True
         return ok, "exit 0" if ok else "exit 1: 2 failed", self.tests_ran
@@ -169,7 +182,7 @@ class PhaseRouting(TempCwd):
     def test_clean_user_facing_phase(self):
         h = self.drive()
         self.assertEqual(h.run(),
-                         ["plan", "implement", "test", "review", "e2e", "docs", "commit"])
+                         ["plan", "implement", "test", "review", "e2e", "screens", "docs", "commit"])
 
     def test_phase_that_is_not_user_facing_skips_e2e(self):
         h = self.drive(user_facing=False)
@@ -218,14 +231,14 @@ class PhaseRouting(TempCwd):
                                                                  "findings": []}
         h.returns["review"] = review
         self.assertEqual(h.run(), ["plan", "implement", "test", "review", "review_fix", "test",
-                                   "review", "e2e", "docs", "commit"])
+                                   "review", "e2e", "screens", "docs", "commit"])
 
     def test_phase_out_of_review_rounds_still_runs_e2e_and_docs(self):
         """Regression: it used to jump from the last review straight to the commit."""
         h = self.drive(max_review_rounds=2, audit_fixes=False)
         h.returns["review"] = blocking_review
         route = h.run()
-        self.assertEqual(route[-3:], ["e2e", "docs", "commit"])
+        self.assertEqual(route[-4:], ["e2e", "screens", "docs", "commit"])
         self.assertEqual(route.count("review"), 2)
         self.assertIn("not re-reviewed", " ".join(h.warnings))
 
@@ -247,8 +260,8 @@ class PhaseRouting(TempCwd):
         h = self.drive(max_review_rounds=2)
         h.returns["review"] = blocking_review
         route = h.run()
-        self.assertEqual(route, ["plan", "implement", "test", "review", "review_fix", "test",
-                                 "review", "review_fix", "test", "review_audit", "e2e", "docs", "commit"])
+        self.assertEqual(route, ["plan", "implement", "test", "review", "review_fix", "test", "review",
+                                 "review_fix", "test", "review_audit", "e2e", "screens", "docs", "commit"])
         self.assertTrue((h.o.phase_dir(0) / "REVIEW-r2-audit.md").exists())
         self.assertEqual(h.warnings, [])            # the fixes held, so there is nothing to report
 
@@ -266,7 +279,7 @@ class PhaseRouting(TempCwd):
         h.returns["review_audit"] = blocking_review
         route = h.run()
         self.assertEqual(route, ["plan", "implement", "test", "review", "review_fix", "test",
-                                 "review_audit", "review_fix", "test", "e2e", "docs", "commit"])
+                                 "review_audit", "review_fix", "test", "e2e", "screens", "docs", "commit"])
         warnings = " ".join(h.warnings)
         self.assertIn("audit of the round-1 fixes found blocker/major findings", warnings)
         self.assertIn("not re-checked", warnings)
@@ -330,7 +343,7 @@ class PhaseRouting(TempCwd):
         route = h.run()
         self.assertEqual(route.count("review"), 2)                  # both tries at round 1
         self.assertIn("did not complete in 2 attempts", " ".join(h.warnings))
-        self.assertEqual(route[-3:], ["e2e", "docs", "commit"])
+        self.assertEqual(route[-4:], ["e2e", "screens", "docs", "commit"])
 
     def test_a_suite_that_passes_without_running_a_test_is_a_warning(self):
         """A green exit code over zero tests certifies nothing, and used to read as a pass."""
@@ -350,7 +363,7 @@ class PhaseRouting(TempCwd):
         h.e2e_ok = [False, True]
         route = h.run()
         self.assertEqual(route, ["plan", "implement", "test", "review", "e2e", "e2e_fix",
-                                 "docs", "commit"])
+                                 "screens", "docs", "commit"])
 
     def test_unit_tests_failing_after_e2e_fixes_return_to_docs_not_review(self):
         """Regression: the phase used to be sent back into another review round."""
@@ -359,7 +372,7 @@ class PhaseRouting(TempCwd):
         h.tests_ok = [True, False, True]     # first suite, then the check after e2e fixes, then the fix
         route = h.run()
         self.assertEqual(route, ["plan", "implement", "test", "review", "e2e", "e2e_fix",
-                                 "test_fix", "test", "docs", "commit"])
+                                 "test_fix", "test", "screens", "docs", "commit"])
         self.assertEqual(route.count("review"), 1)
 
     def test_e2e_that_keeps_failing_gives_up_with_a_warning(self):
@@ -367,7 +380,7 @@ class PhaseRouting(TempCwd):
         h.e2e_ok = [False] * 10
         route = h.run()
         self.assertEqual(route.count("e2e_fix"), 2)
-        self.assertEqual(route[-2:], ["docs", "commit"])
+        self.assertEqual(route[-3:], ["screens", "docs", "commit"])
         self.assertTrue(any("still failing" in w for w in h.warnings))
 
     def test_implementation_continues_while_tasks_remain(self):
@@ -392,7 +405,7 @@ class PhaseRouting(TempCwd):
         self.assertNotIn("e2e_fix", route)
         self.assertEqual(route[-2:], ["docs", "commit"])
         self.assertTrue(any("could not be started" in w for w in h.warnings))
-        self.assertEqual(h.surfaces, ["up", "down"])
+        self.assertEqual(h.surfaces, ["up", "down", "up", "down"])   # e2e, then the gallery
 
     def test_surfaces_are_stopped_even_when_the_step_raises(self):
         h = self.drive()
@@ -408,7 +421,7 @@ class PhaseRouting(TempCwd):
         h = self.drive()
         h.e2e_ok = [False, True]
         h.run()
-        self.assertEqual(h.surfaces, ["up", "up", "down"])
+        self.assertEqual(h.surfaces, ["up", "up", "up", "down"])   # e2e, its fix, the gallery
 
     def test_a_reviewer_that_edits_the_tree_is_reported(self):
         """Edit/Write are blocked for the review session, but `sed -i` through Bash is not."""
@@ -444,8 +457,123 @@ class PhaseRouting(TempCwd):
                             f"{step} -> {method} is not a method")
         o = self.drive().o
         for produced in (o.after_review({"user_facing": True}), o.after_review({"user_facing": False}),
-                         o.after_e2e()):
+                         o.after_e2e(), o.after_screens()):
             self.assertIn(produced, autodev.PHASE_STEPS)
+
+
+# --------------------------------------------------------------------------- the phase gallery
+class Screenshots(TempCwd):
+    """The pictures a phase leaves behind, and what happens when it claims ones it did not take."""
+
+    def drive(self, **kw):
+        h = PhaseHarness(**kw)
+        self.addCleanup(h.close)
+        return h
+
+    def phase_screens(self, h):
+        return h.state["phases"][0].get("screens") or []
+
+    def test_a_user_facing_phase_records_the_frames_it_captured(self):
+        h = self.drive()
+        h.shots = [("01-empty.png", "nothing open yet"), ("02-list.svg", "three invoices")]
+        h.run()
+        self.assertEqual([s["caption"] for s in self.phase_screens(h)],
+                         ["nothing open yet", "three invoices"])
+        self.assertEqual(h.warnings, [])
+
+    def test_the_progress_document_links_the_gallery(self):
+        h = self.drive()
+        h.run()
+        progress = (util.AD / "PROGRESS.md").read_text()
+        self.assertIn("## Screens", progress)
+        self.assertIn("phases/01-p1/SCREENS.md", progress)
+        self.assertIn("the app with nothing in it", progress)
+
+    def test_screens_off_skips_the_step(self):
+        h = self.drive(screens="off")
+        route = h.run()
+        self.assertNotIn("screens", route)
+        self.assertEqual(route[-2:], ["docs", "commit"])
+
+    def test_a_phase_that_is_not_user_facing_is_not_photographed(self):
+        h = self.drive(user_facing=False)
+        self.assertNotIn("screens", h.run())
+
+    def test_the_gallery_still_runs_with_the_end_to_end_step_off(self):
+        """The frames are documentation, not QA: turning e2e off must not take them away."""
+        h = self.drive(e2e="off")
+        route = h.run()
+        self.assertNotIn("e2e", route)
+        self.assertIn("screens", route)
+        self.assertEqual(len(self.phase_screens(h)), 1)
+
+    def test_a_frame_that_was_never_written_is_not_listed(self):
+        h = self.drive()
+        h.returns["screens"] = lambda _h: {
+            "status": "done", "summary": "",
+            "screenshots": [{"file": ".autodev/phases/01-p1/screenshots/ghost.png", "caption": "x"}]}
+        h.run()
+        self.assertEqual(self.phase_screens(h), [])
+        self.assertTrue(any("left no usable frame" in w for w in h.warnings))
+
+    def test_a_file_outside_the_phase_directory_is_refused(self):
+        h = self.drive()
+
+        def claim(_h):
+            real = _h.capture_screens()
+            Path("stray.png").write_bytes(b"\x89PNG\r\n" + b"x" * 64)
+            real["screenshots"].append({"file": "stray.png", "caption": "not this phase"})
+            return real
+        h.returns["screens"] = claim
+        h.run()
+        self.assertEqual([s["file"].rsplit("/", 1)[-1] for s in self.phase_screens(h)],
+                         ["01-empty-state.png"])
+        self.assertTrue(any("stray.png" in w for w in h.warnings))
+
+    def test_a_frame_too_heavy_to_commit_is_refused(self):
+        h = self.drive()
+
+        def claim(_h):
+            pdir = _h.o.phase_dir(0) / "screenshots"
+            pdir.mkdir(parents=True, exist_ok=True)
+            big = pdir / "01-huge.png"
+            big.write_bytes(b"\x89PNG\r\n" + b"x" * (autodev.MAX_SCREEN_BYTES + 1))
+            return {"status": "done", "summary": "",
+                    "screenshots": [{"file": big.as_posix(), "caption": "every pixel"}]}
+        h.returns["screens"] = claim
+        h.run()
+        self.assertEqual(self.phase_screens(h), [])
+        self.assertTrue(any("over the" in w for w in h.warnings))
+
+    def test_a_phase_with_nothing_to_show_says_so_without_a_warning(self):
+        h = self.drive()
+        h.returns["screens"] = {"status": "skipped", "summary": "a migration has no screen"}
+        h.run()
+        self.assertEqual(self.phase_screens(h), [])
+        self.assertEqual(h.warnings, [])
+        self.assertTrue(any(e["label"] == "p01-screens" and e["status"] == "skipped"
+                            for e in h.state["events"]))
+
+    def test_a_blocked_capture_is_reported_and_the_phase_carries_on(self):
+        h = self.drive()
+        h.returns["screens"] = {"status": "blocked", "summary": "no screenshot tool on this machine"}
+        route = h.run()
+        self.assertEqual(route[-2:], ["docs", "commit"])
+        self.assertTrue(any("screenshots blocked" in w for w in h.warnings))
+
+    def test_a_capture_session_that_edits_the_product_is_reported(self):
+        h = self.drive()
+        h.status = ["", "", " M src/app.py"]      # review before/after, then after the capture
+        h.run()
+        self.assertTrue(any("screenshot step changed the working tree" in w for w in h.warnings))
+
+    def test_the_session_reads_the_capture_command_from_the_profile(self):
+        h = self.drive()
+        h.run()
+        prompt = next(p for p in h.prompts if p.startswith("Step: SCREENSHOTS"))
+        self.assertIn(".autodev/PROFILE.md", prompt)
+        self.assertIn("guides/screenshot-capture.md", prompt)
+        self.assertNotIn("{{", prompt)
 
 
 # --------------------------------------------------------------------------- command vetting
@@ -2762,7 +2890,8 @@ class SkillLayout(unittest.TestCase):
 
     def test_every_prompt_a_step_renders_exists(self):
         for name in ("_autonomy", "architect", "roadmap", "plan", "implement", "test_fix",
-                     "review", "review_fix", "review_audit", "e2e", "e2e_fix", "docs", "finalize"):
+                     "review", "review_fix", "review_audit", "e2e", "e2e_fix", "screens", "docs",
+                     "finalize"):
             self.assertTrue((util.PROMPTS_DIR / f"{name}.md").is_file(), f"prompts/{name}.md is missing")
 
     def test_a_prompt_renders_its_placeholders(self):
@@ -2818,7 +2947,8 @@ class DashboardNumbers(unittest.TestCase):
         ph = {"status": "in_progress"}
         at_test = dashdata.phase_progress(ph, True, "test")
         self.assertEqual(at_test, dashdata.phase_progress(ph, True, "test_fix"))
-        self.assertEqual(at_test, dashdata.phase_progress(ph, True, "review_fix") - 1 / 7)
+        self.assertEqual(at_test,
+                         dashdata.phase_progress(ph, True, "review_fix") - 1 / len(dashdata.SPINE))
 
     def test_a_finished_phase_is_complete_whatever_the_step_says(self):
         self.assertEqual(dashdata.phase_progress({"status": "done"}, True, "plan"), 1.0)
@@ -2837,8 +2967,9 @@ class DashboardNumbers(unittest.TestCase):
         self.assertFalse(rows[0].user_facing)
 
     def test_overall_progress_averages_the_phases(self):
-        # one done, one at the tests (2/7), one untouched
-        self.assertAlmostEqual(dashdata.overall_progress(dash_state()), (1 + 2 / 7) / 3)
+        # one done, one at the tests (two steps into the spine), one untouched
+        self.assertAlmostEqual(dashdata.overall_progress(dash_state()),
+                               (1 + 2 / len(dashdata.SPINE)) / 3)
 
     def test_a_run_without_a_roadmap_yet_has_barely_started(self):
         self.assertEqual(dashdata.overall_progress({"step": "architect", "phases": []}), 0.0)
@@ -2846,8 +2977,8 @@ class DashboardNumbers(unittest.TestCase):
 
     def test_the_estimate_comes_from_the_phases_that_finished(self):
         eta = dashdata.eta_seconds(dash_state())
-        # phase one took 600s; phase two is 2/7 done, phase three untouched
-        self.assertAlmostEqual(eta, 600 * (1 - 2 / 7) + 600)
+        # phase one took 600s; phase two is two spine steps in, phase three untouched
+        self.assertAlmostEqual(eta, 600 * (1 - 2 / len(dashdata.SPINE)) + 600)
 
     def test_nothing_is_estimated_before_the_first_phase_lands(self):
         st = dash_state()

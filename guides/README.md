@@ -16,6 +16,7 @@ Keep every guide short — a fresh session pays tokens for each read.
 | `qa-oracles.md` | Deciding what "correct" means before writing a test |
 | `case-taxonomy.md` | Enumerating the cases a feature needs |
 | `e2e-authoring.md` | Writing or fixing an end-to-end spec that drives the real app |
+| `screenshot-capture.md` | Photographing the product at the end of a phase |
 | `review-rubric.md` | Reviewing a phase's diff |
 | `concise-engineering-output.md` | Writing a summary, review, or progress note for an engineer |
 

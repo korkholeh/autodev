@@ -107,6 +107,12 @@ ENV_CLAIMS = (
 BLOCKING = {"blocker", "major"}
 DEFAULT_BRANCH = "main"     # what a repository with no commits is given, whatever `git init` called it
 
+# The phase gallery: committed with the phase, so it is small on purpose — a handful of frames a
+# developer scans in ten seconds, not an album nobody opens and nobody can clone quickly either.
+MAX_SCREENS_PER_PHASE = 8
+MAX_SCREEN_BYTES = 1024 * 1024
+SCREEN_SUFFIXES = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".txt")
+
 DEFAULTS = {
     "test_cmd": "",
     "threshold": 85.0,
@@ -135,6 +141,7 @@ DEFAULTS = {
     "e2e_down_cmd": "",      # stops them again
     "e2e_ready_url": "",     # polled until it answers before the suite runs
     "e2e_timeout": 45,       # minutes
+    "screens": "auto",       # auto = photograph user-facing phases after the e2e step; off = never
     "audit_fixes": True,     # check the last round's fixes, which no review round is left to see
     "docs": True,            # per-phase documentation step
     "finalize": True,        # closing documentation + handoff session
@@ -189,6 +196,25 @@ E2E_SCHEMA = {
         "e2e_command": {"type": "string"},
         "e2e_up_command": {"type": "string"},
         "e2e_down_command": {"type": "string"},
+    },
+    "required": ["status", "summary"],
+}
+SCREENS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "partial", "skipped", "blocked"]},
+        "summary": {"type": "string"},
+        "screenshots": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "caption": {"type": "string"},
+                },
+                "required": ["file", "caption"],
+            },
+        },
     },
     "required": ["status", "summary"],
 }
@@ -365,6 +391,7 @@ PHASE_STEPS = {         # phase step -> the Orchestrator method that runs it and
     "plan": "_plan", "implement": "_implement", "test": "_test", "test_fix": "_test_fix",
     "review": "_review", "review_fix": "_review_fix", "review_audit": "_review_audit",
     "e2e": "_e2e", "e2e_fix": "_e2e_fix",
+    "screens": "_screens",
     "docs": "_docs", "commit": "_commit",
 }
 
@@ -2038,8 +2065,8 @@ class Orchestrator:
         run.ctx["fix_source"] = run.ctx["audit_source"] = name
         return "review_fix"
 
-    def _with_surfaces(self, run: "PhaseRun", body, skipped: str) -> str:
-        """Run a step against started surfaces, and always stop them unless the phase stays in e2e.
+    def _with_surfaces(self, run: "PhaseRun", body, skipped: str, on_skip=None) -> str:
+        """Run a step against started surfaces, and always stop them unless the phase still needs them.
 
         The teardown is in a `finally` so an interrupt or a failed step does not leave a dev server
         holding its port for the next run."""
@@ -2047,13 +2074,13 @@ class Orchestrator:
             run.ctx["warnings"].append(skipped)
             log("WARN e2e surfaces did not start — skipping this step for this phase")
             self.surfaces_down()
-            return self.after_e2e()
+            return (on_skip or self.after_e2e)()
         nxt = None
         try:
             nxt = body(run)
             return nxt
         finally:
-            if nxt != "e2e_fix":
+            if nxt not in ("e2e_fix", "screens"):
                 self.surfaces_down()
 
     def _e2e(self, run: "PhaseRun") -> str:
@@ -2078,7 +2105,7 @@ class Orchestrator:
         run.ctx["e2e_fix_attempts"] = run.ctx.get("e2e_fix_attempts", 0) + 1
         nxt = self._with_surfaces(run, self._e2e_fix_body,
                                   "e2e fix skipped: the surfaces could not be started")
-        if nxt in ("docs", "commit"):
+        if nxt in ("screens", "docs", "commit"):
             # the unit suite has to still be green after fixing the product for end-to-end cases,
             # and afterwards the phase carries on to where it was going — not back into review
             ok, summary, _ = self.run_tests(run.dir)
@@ -2112,6 +2139,87 @@ class Orchestrator:
                                        f"({summary}) — see {run.dir.as_posix()}/E2E_OUTPUT.txt")
             return self.after_e2e()
         return "e2e_fix"
+
+    def _screens(self, run: "PhaseRun") -> str:
+        """Photograph what this phase built, so the morning can start by looking instead of reading."""
+        return self._with_surfaces(run, self._screens_body,
+                                   "screenshots skipped: the surfaces could not be started",
+                                   on_skip=self.after_screens)
+
+    def _screens_body(self, run: "PhaseRun") -> str:
+        marks = self.worktree_marks()
+        res = self.session(run.label, render("screens", **run.common), self.cfg["model_qa"],
+                           SCREENS_SCHEMA, "status")
+        # The frames live under `.autodev/`, which worktree_marks ignores, so anything it sees now is
+        # the step editing the product it was sent to photograph — reviewed by nobody, after the
+        # review. The changes stay (deleting them could throw away a seeding fixture the capture
+        # needs), but they are never silent.
+        touched = sorted(p[3:] for p in self.worktree_marks() ^ marks)
+        if touched:
+            shown = ", ".join(touched[:5]) + (f" +{len(touched) - 5} more" if len(touched) > 5 else "")
+            self.event(run.label, "touched the tree", f"the screenshot step changed {shown}")
+            run.ctx["warnings"].append(f"the screenshot step changed the working tree ({shown}); "
+                                       "those edits are part of this phase's commit, unreviewed")
+        status = res.get("status", "done")
+        kept, rejected = self.collect_screens(run, res.get("screenshots") or [])
+        run.ph["screens"] = kept
+        for path, why in rejected:
+            log(f"WARN screenshot {path}: {why}")
+        if status == "blocked":
+            run.ctx["warnings"].append(f"screenshots blocked: {one_line(res.get('summary'), 160)}")
+        elif status == "skipped":
+            self.event(run.label, "skipped", one_line(res.get("summary"), 200)
+                       or "nothing user-visible to photograph")
+        elif not kept:
+            run.ctx["warnings"].append("the screenshot step returned "
+                                       f"{status} but left no usable frame behind")
+        if rejected:
+            run.ctx["warnings"].append(f"{len(rejected)} screenshot(s) this step reported are not "
+                                       "usable: " + "; ".join(f"{p} ({w})" for p, w in rejected[:3]))
+        if kept:
+            self.event(run.label, status, f"{len(kept)} frame(s) → "
+                       f"{(run.dir / 'SCREENS.md').as_posix()}")
+        return self.after_screens()
+
+    def collect_screens(self, run: "PhaseRun", claimed: list):
+        """Keep the frames that are actually there, and say why the others are not.
+
+        A session that reports six screenshots has reported six paths; the files are what the
+        developer opens in the morning. Each one is checked on disk before it reaches PROGRESS.md,
+        and a path outside the phase's own directory is not a screenshot of this phase."""
+        shots_dir = (run.dir / "screenshots").resolve()
+        kept, rejected, seen = [], [], set()
+        for item in claimed[:MAX_SCREENS_PER_PHASE]:
+            raw = (item.get("file") or "").strip()
+            if not raw:
+                continue
+            path = Path(raw)
+            try:
+                resolved = path.resolve()
+                inside = resolved.is_relative_to(shots_dir)
+            except (OSError, ValueError):
+                inside, resolved = False, path
+            rel = path.as_posix()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            if not inside:
+                rejected.append((rel, f"outside {shots_dir.name}/ of this phase"))
+            elif not path.is_file():
+                rejected.append((rel, "no such file"))
+            elif path.suffix.lower() not in SCREEN_SUFFIXES:
+                rejected.append((rel, f"{path.suffix or 'no extension'} is not a screenshot format"))
+            elif not path.stat().st_size:
+                rejected.append((rel, "empty file"))
+            elif path.stat().st_size > MAX_SCREEN_BYTES:
+                rejected.append((rel, f"{path.stat().st_size / 1048576:.1f} MB, over the "
+                                      f"{MAX_SCREEN_BYTES // 1048576} MB limit"))
+            else:
+                kept.append({"file": rel, "caption": one_line(item.get("caption"), 200)})
+        if len(claimed) > MAX_SCREENS_PER_PHASE:
+            rejected.append((f"{len(claimed) - MAX_SCREENS_PER_PHASE} more",
+                             f"over the {MAX_SCREENS_PER_PHASE} frames a phase gallery holds"))
+        return kept, rejected
 
     def _docs(self, run: "PhaseRun") -> str:
         """Make the documentation true — for what this phase actually changed.
@@ -2164,7 +2272,20 @@ class Orchestrator:
         return self.after_e2e()
 
     def after_e2e(self) -> str:
+        """Where a phase goes with the end-to-end step behind it: the gallery, the docs, or the commit."""
+        ph = self.current_phase()
+        if self.cfg.get("screens") != "off" and ph.get("user_facing", True):
+            return "screens"
+        return self.after_screens()
+
+    def after_screens(self) -> str:
         return "docs" if self.cfg.get("docs") else "commit"
+
+    def current_phase(self) -> dict:
+        st = self.state
+        phases = st.get("phases") or []
+        i = st.get("phase_index", 0)
+        return phases[i] if 0 <= i < len(phases) else {}
 
     def step_finalize(self) -> None:
         """One closing session: make the documentation true, and write the morning handoff."""
@@ -2294,6 +2415,18 @@ class Orchestrator:
                 warn = "; ".join(ph.get("warnings") or []).replace("|", "\\|")
                 lines.append(f"| {k} | {ph['title'].replace('|', '/')} | {'yes' if ph.get('user_facing', True) else 'no'} "
                              f"| {icons.get(ph['status'], '')} {ph['status']} | {ph.get('commit') or ''} | {warn} |")
+            lines.append("")
+        gallery = [(k, ph) for k, ph in enumerate(phases, 1) if ph.get("screens")]
+        if gallery:
+            lines += ["## Screens", "",
+                      "What the product looked like at the end of each phase — the newest first.", ""]
+            for k, ph in reversed(gallery):
+                shots = ph["screens"]
+                rel = self.phase_dir(k - 1).relative_to(AD).as_posix()
+                lines.append(f"- **Phase {k} — {ph['title']}**: [{len(shots)} frame"
+                             f"{'' if len(shots) == 1 else 's'}]({rel}/SCREENS.md) — "
+                             + "; ".join(one_line(s.get("caption"), 80) for s in shots[:3])
+                             + (" …" if len(shots) > 3 else ""))
             lines.append("")
         lines += ["## Timeline", ""]
         for e in st["events"][-300:]:
@@ -2669,6 +2802,9 @@ def main() -> int:
     run.add_argument("--e2e-down-cmd", dest="e2e_down_cmd", help="stop them again")
     run.add_argument("--e2e-ready-url", dest="e2e_ready_url", help="poll this URL until it answers before the suite")
     run.add_argument("--e2e-timeout", dest="e2e_timeout", type=int, help="minutes (default 45)")
+    run.add_argument("--screens", choices=["auto", "off"],
+                     help="photograph the product after the e2e step on user-facing phases, into "
+                          "the phase's screenshots/ directory (default auto)")
     run.add_argument("--max-e2e-fix", dest="max_e2e_fix", type=int)
     run.add_argument("--no-audit-fixes", dest="audit_fixes", action="store_const", const=False,
                      help="skip the read-only check of the last review round's fixes")

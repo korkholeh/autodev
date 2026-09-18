@@ -51,8 +51,8 @@ python3 ~/.claude/skills/autodev/scripts/autodev.py run --spec docs/spec.md
 
 ```
 architect ─► roadmap ─► for each phase:
-   plan ─► implement (×N, while [ ] tasks remain) ─► tests ─┬─► review ─┬─► e2e ─┬─► docs ─► commit + tag
-                                                            │          │        └─► e2e_fix (×≤3) ─► docs
+   plan ─► implement (×N, while [ ] tasks remain) ─► tests ─┬─► review ─┬─► e2e ─┬─► screens ─► docs ─► commit + tag
+                                                            │          │        └─► e2e_fix (×≤3) ─► screens
                                                             │          └─► review_fix ─► tests ─┬─► review (round 2)
                                                             │                                   └─► audit (last round)
                                                             └─► test_fix (≤3) ─► tests
@@ -65,6 +65,10 @@ architect ─► roadmap ─► for each phase:
   are up (a command that stays in the foreground needs `--e2e-ready-url`). First a plan with an oracle
   (`e2e/plans/<feature>.plan.yaml`), then the specs, then a run that fixes **the product**, not the tests.
   Services are brought up by the script (`--e2e-up-cmd`), not by the agent.
+- **screens** — one session per user-facing phase, against the same running surfaces, photographs 3–6 states of
+  the product into `.autodev/phases/NN-*/screenshots/` and captions them in that phase's `SCREENS.md`. It is
+  documentation, not testing: it changes no code, and a phase with nothing to show returns `skipped`. How each
+  stack captures a frame is the `screenshot` row of `.autodev/PROFILE.md`. `--screens off` skips it.
 - **audit** — the fixes of the *last* review round have no round left to check them, so a read-only session sees
   exactly that diff (`git diff` against the tree recorded before the fix session) with the review it answered, and
   says whether every blocker and major is really fixed. If it finds one that is not, the phase gets one more fix
@@ -92,7 +96,8 @@ Tests, e2e, commits, and state are handled by the script (no usage limit spent).
 | `.autodev/INTAKE.md` | the developer's answers before the start |
 | `.autodev/PROFILE.md` | stack: layout, exact commands, e2e driver, common pitfalls |
 | `.autodev/guides/` | working rules read by the sessions (gitignored, copied from the skill) |
-| `.autodev/phases/NN-*/` | `PLAN.md`, `REVIEW-rN.md`, `TEST_OUTPUT.txt`, `E2E_OUTPUT.txt` |
+| `.autodev/phases/NN-*/` | `PLAN.md`, `REVIEW-rN.md`, `TEST_OUTPUT.txt`, `E2E_OUTPUT.txt`, `SCREENS.md` + `screenshots/` |
+| `.autodev/SCREENS.md` | the run's gallery, assembled by the final session from the phase ones |
 | `docs/dev/`, `docs/user/` | project documentation (for developers and for users) |
 | `e2e/` | plans with oracles, specs, `RESULTS.md` |
 
@@ -142,6 +147,7 @@ then records the gap as a run warning in `PROGRESS.md`.
 | `--test-cmd CMD` | full test-suite command (otherwise the architect picks it) |
 | `--e2e auto\|off` | end-to-end QA on user-facing phases (`auto` by default) |
 | `--e2e-cmd`, `--e2e-up-cmd`, `--e2e-down-cmd`, `--e2e-ready-url` | e2e suite and service lifecycle (the up command must be idempotent and must return) |
+| `--screens auto\|off` | screenshots of the product after the e2e step on user-facing phases (`auto` by default) |
 | `--allow-cmd BINARY` | also accept commands starting with `BINARY` when a session proposes one (repeatable) |
 | `--web on\|off` | let the sessions use WebFetch/WebSearch (`off` by default) |
 | `--mcp-config FILE` | MCP servers for the sessions, a file or a JSON string (repeatable) |
@@ -518,7 +524,7 @@ start over with `--fresh`, or read `.autodev/state.json` and accept it deliberat
 ## What to edit in the skill itself
 
 - `prompts/` — one file per pipeline step (`architect`, `roadmap`, `plan`, `implement`, `test_fix`,
-  `review`, `review_fix`, `e2e`, `e2e_fix`, `docs`, `finalize`) + `intake.md` for the pre-start interview.
+  `review`, `review_fix`, `e2e`, `e2e_fix`, `screens`, `docs`, `finalize`) + `intake.md` for the pre-start interview.
 - `guides/` — working rules shared across all stacks (oracles, case taxonomy, debugging, documentation style).
 - `profiles/` — stack profiles. A new stack = one more file modeled on `profiles/generic.md`.
 - `scripts/autodev.py` — the entry point: the phase state machine, the sessions, git and the CLI. A phase step is

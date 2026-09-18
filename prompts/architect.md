@@ -35,8 +35,10 @@ guide. Expect roughly 3–8 of them. Do not write an ADR for a choice a later ph
 mitigation and where it will be handled. Include product risk (we build the wrong thing), not only technical risk.
 
 **4. `.autodev/PROFILE.md`** — correct it against reality: replace every `TODO` with the exact command this project
-will use, fix anything the profile assumed wrongly, and delete guidance that does not apply here. Later sessions
-trust this file; leave nothing aspirational in it.
+will use, fix anything the profile assumed wrongly, and delete guidance that does not apply here. The `screenshot`
+row is one of those commands: the screenshot step reads it to photograph the product at the end of each phase, so
+name the way this project can actually capture a frame headlessly (or say plainly that it has no visual surface).
+Later sessions trust this file; leave nothing aspirational in it.
 
 Also append the assumptions you made to `.autodev/DECISIONS.md`.
 

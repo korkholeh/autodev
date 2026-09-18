@@ -5,8 +5,8 @@ any of it. Make the repository self-explanatory and tell the truth about its sta
 
 Read: `.autodev/ROADMAP.md`, `.autodev/PROGRESS.md`, `.autodev/DECISIONS.md` (the whole log this time — but its
 `## ` sections are the index, and `grep -n '^- \[' ` gives you the entries without the reasoning), `.autodev/RISKS.md`,
-`.autodev/ARCHITECTURE.md`, every `.autodev/phases/*/PLAN.md` and `REVIEW-r*.md` (skim), the current `docs/` tree,
-and `git log --oneline {{base_sha}}..HEAD`.
+`.autodev/ARCHITECTURE.md`, every `.autodev/phases/*/PLAN.md`, `REVIEW-r*.md` and `SCREENS.md` (skim), the current
+`docs/` tree, and `git log --oneline {{base_sha}}..HEAD`.
 
 Guides: `.autodev/guides/write-project-docs.md`, `.autodev/guides/user-docs.md`,
 `.autodev/guides/concise-engineering-output.md` for the summaries.
@@ -22,8 +22,12 @@ Guides: `.autodev/guides/write-project-docs.md`, `.autodev/guides/user-docs.md`,
    `.autodev/ARCHITECTURE.md`, the built system is the truth; note the divergence and link the decision.
 4. **`CHANGELOG.md`** — turn `## Unreleased` into the first release section with today's date, grouped by impact,
    breaking changes first.
-5. **`.autodev/HANDOFF.md`** — the morning briefing, one screen:
-   - **What was built** — three sentences.
+5. **`.autodev/SCREENS.md`** — the gallery of the whole run, if any phase captured frames: the product as it
+   looks now, newest phase first, each frame embedded with its caption and a link to the phase it came from.
+   Where the same view was captured in several phases, keep the latest and link the earlier one beside it. Do not
+   re-capture anything; this step only assembles what the phases photographed.
+6. **`.autodev/HANDOFF.md`** — the morning briefing, one screen:
+   - **What was built** — three sentences, and a link to `.autodev/SCREENS.md` when there are frames to look at.
    - **State** — every check that ran and its result, by name (`{{test_command}}`, the e2e command, the linter).
      Separate verified from assumed.
    - **Decisions a human should confirm** — the entries from `DECISIONS.md` that a developer might overrule,
@@ -32,7 +36,8 @@ Guides: `.autodev/guides/write-project-docs.md`, `.autodev/guides/user-docs.md`,
      plans, and anything that needs credentials, hardware or a product answer.
    - **Open risks** — the rows of `RISKS.md` that are still live.
    - **Next steps** — what you would do first tomorrow, in order.
-6. **`.autodev/PR_BODY.md`** — a reviewer-facing description of the whole branch: one sentence on what now works,
+7. **`.autodev/PR_BODY.md`** — a reviewer-facing description of the whole branch: one sentence on what now works,
+   the two or three most telling screenshots embedded (relative repository paths, so GitHub renders them),
    a short *Why*, then **Worth a close look** — only the parts that need human judgment (a security or money path, a
    migration, a public contract, a deliberate trade-off, anything incomplete). Do not narrate the diff.
 

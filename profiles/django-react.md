@@ -28,6 +28,7 @@ while the product is broken, because nothing tests the contract between them.
 | e2e up | start the backend (migrated and seeded) and the frontend dev server |
 | e2e | `pytest e2e -q` (pytest-playwright) |
 | e2e down | stop both |
+| screenshot | Playwright: viewport 1280×800, `page.screenshot(path=...)` against the Vite dev server (or the built bundle Django serves) |
 
 ## The API contract
 
@@ -58,3 +59,11 @@ backend-provided test channel, never by querying the database from the spec.
 - CORS and CSRF settings that work in dev and fail behind a proxy: test the deployed configuration shape.
 - Serializer-level permission checks are not view-level permission checks. Assert refusal at the endpoint.
 - A frontend that swallows a 4xx into a generic "something went wrong" hides real bugs from e2e. Surface the message.
+
+## Screenshots
+
+- Playwright against the Vite dev server (or the built bundle Django serves) at 1280×800, with an API that is
+  seeded through the ORM rather than clicked through.
+- Wait for the rendered element, not for the request: a frame taken while a skeleton loader is up shows the
+  skeleton.
+- Disable React Query devtools and any dev-only overlay before capturing.

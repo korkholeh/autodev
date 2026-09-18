@@ -29,6 +29,7 @@ template. Business rules live in `services.py`; queries live in `selectors.py`.
 | e2e up | `python manage.py migrate && python manage.py seed_e2e && python manage.py runserver 8001 &` — or the project's compose file |
 | e2e | `pytest e2e -q` (pytest-playwright) |
 | e2e down | stop the server the e2e up command started |
+| screenshot | Playwright: `page.set_viewport_size({'width':1280,'height':800})` then `page.screenshot(path=...)` from a one-off `pytest` helper or `python -m playwright screenshot` |
 
 Add `makemigrations --check --dry-run` to the lint step: a model change with no migration must fail the build.
 
@@ -57,3 +58,13 @@ Seed data through a management command (`seed_e2e`) so the suite never writes to
 - N+1 queries hide in templates. Assert query counts (`assertNumQueries`) on list views.
 - A migration that rewrites a large table locks it; state the strategy in the ADR before writing it.
 - Permissions on a view are not permissions on a template include — check both.
+
+## Screenshots
+
+- Drive the browser with Playwright at a fixed 1280×800 viewport; log in through the UI once and reuse the
+  storage state so every frame starts on the page it is about.
+- Seed through the ORM (a management command or a fixture), not through the UI: readable, boring rows, no real
+  names or addresses.
+- htmx swaps are the trap — wait for the swapped element (`page.wait_for_selector`), never for a timeout, or the
+  frame catches the pre-swap markup.
+- Turn the Django debug toolbar off for the capture; it covers a third of the page.

@@ -22,6 +22,7 @@ linter configured in-repo.
 | e2e up | TODO (or `-` when the suite needs nothing running) |
 | e2e | TODO |
 | e2e down | TODO |
+| screenshot | TODO — the headless way to photograph this product's surface (see the Screenshots section) |
 
 ## Testing layers
 
@@ -42,3 +43,12 @@ a started server for an API-only product. Whatever it is, write it down here.
 - A test command that only works from one directory, or only with an editor plugin, is not a test command.
 - A suite that needs a service running must start it from `e2e up`, not from inside a test.
 - Pin versions. An unpinned toolchain turns a green run into a red one with no diff.
+
+## Screenshots
+
+- Fill the `screenshot` row with the headless way to photograph this product's surface: a browser driver for a
+  web UI, the platform's screenshot tool for a native app, an SVG/text dump for a terminal one.
+- Whatever the surface, the rules are the same: fixed size, seeded and boring data, no dev overlays, wait for
+  the state rather than for the clock.
+- A product with no visual surface (a library, a daemon) says so — the screenshot step returns `skipped` instead
+  of photographing a test run.

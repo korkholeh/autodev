@@ -31,5 +31,6 @@ question was never asked, the architect step decides and writes an ADR.
 | `test` | The whole unit+integration suite, non-interactive, from the repo root — this is autodev's `--test-cmd` |
 | `lint` / `format` | Static checks and the formatter |
 | `e2e up` / `e2e` / `e2e down` | Start the surfaces, run the end-to-end suite, stop them — autodev's `--e2e-up-cmd`, `--e2e-cmd`, `--e2e-down-cmd` |
+| `screenshot` | How this stack photographs its own surface headlessly — the screenshot step reads it |
 
 Every command must be non-interactive and must work from the repository root on a clean machine.

@@ -29,6 +29,7 @@ Prefer `xcodebuild` with an explicit scheme; it is the only form that works unat
 | e2e up | `-` (XCUITest launches the app itself) |
 | e2e | `xcodebuild -scheme <App>UITests -destination 'platform=macOS' test` |
 | e2e down | `-` |
+| screenshot | `XCUIScreen.main.screenshot()` written to a file from a UI test, or `screencapture -x -o -l<window-id> <path>.png` |
 
 Add `-quiet` or pipe through `xcbeautify` when the raw output floods the log. Never rely on an interactive
 Xcode action; everything must run from the command line.
@@ -58,3 +59,12 @@ each one is needed, where user data lives (`~/Library/Application Support/<bundl
 - A schema change in the local store needs a migration, not a wipe. Users cannot re-create their data.
 - Keychain access, notifications, and file prompts do not work without the right entitlement and a code signature.
 - `xcodebuild` fails silently in odd ways when the scheme is not shared: mark schemes shared and commit them.
+
+## Screenshots
+
+- From a UI test: `XCUIScreen.main.screenshot()` (or `app.windows.firstMatch.screenshot()` for the window
+  alone), written to the phase's `screenshots/` directory with `try png.write(to:)`.
+- Outside the test target, `screencapture -x -o -l<window-id>` photographs one window without the desktop; the
+  window id comes from `CGWindowListCopyWindowInfo`, not from a guess.
+- Fix the window size in the test before capturing, and keep it for the whole run.
+- Seed with a launch argument the app honours, and capture in light appearance unless the phase is about theming.

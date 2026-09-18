@@ -30,6 +30,7 @@ docs/dev, docs/user
 | e2e up | `alembic upgrade head`, seed, start uvicorn and the frontend dev server |
 | e2e | `pytest e2e -q` (pytest-playwright) |
 | e2e down | stop both |
+| screenshot | Playwright: viewport 1280×800, `page.screenshot(path=...)` against the Vite dev server |
 
 ## The API contract
 
@@ -62,3 +63,11 @@ Seed through a backend CLI command or a dedicated test-only endpoint that exists
 - A 422 from pydantic looks nothing like a 400 the frontend expects — fix the mapping once, in one place.
 - Dependency-injected auth is easy to forget on a new router; assert refusal on every protected endpoint.
 - `--reload` is a development flag only. The operations doc must give the real command with worker counts.
+
+## Screenshots
+
+- Playwright against the Vite dev server at 1280×800; seed the database through the app's own service layer or
+  a fixture script, not through the UI.
+- Wait for the element the state is about — a spinner that is still on screen is not the state you meant.
+- Capture one API-driven error state (a 4xx the UI renders); it is the frame reviewers look for and the one that
+  is never in a demo.

@@ -32,6 +32,7 @@ tested there. `app.py` wires them together and owns nothing else.
 | e2e up | `-` |
 | e2e | `pytest e2e -q` |
 | e2e down | `-` |
+| screenshot | `app.save_screenshot(<path>.svg)` from a Pilot script, or `textual run --screenshot 3 <app>` |
 
 ## Testing layers
 
@@ -91,3 +92,12 @@ including the snapshot workflow (`pytest --snapshot-update` and why a diff is re
 - Colour and unicode are not universal: check with a 16-colour terminal, with `NO_COLOR` set, and over SSH.
 - A modal screen that never dismisses on error leaves the app stuck with no way back; every `push_screen` needs its
   matching dismiss path tested.
+
+## Screenshots
+
+- `App.save_screenshot("<name>.svg")` from a Pilot script is the capture to use: it renders the real widget tree, the
+  text stays selectable and the diff between phases stays readable.
+- Fix the size in the Pilot run (`app.run_test(size=(100, 30))`) and keep it for the whole run.
+- `await pilot.pause()` before saving — the same race that breaks Pilot assertions produces a half-drawn frame.
+- The snapshots in `tests/__snapshots__/` are assertions, not the gallery; capture the phase's frames separately
+  so a snapshot update never rewrites what the developer is looking at.

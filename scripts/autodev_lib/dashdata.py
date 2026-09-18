@@ -20,11 +20,12 @@ from autodev_lib.util import AD, PID_FILE, STATE_FILE, STOP_FILE
 # The spine of a phase: the steps every phase passes through, in order. The fix steps are not on it
 # — `test_fix` is the phase going round the test step again, not progress past it — so a phase that
 # fails its suite three times keeps reading as "at the tests" instead of marching on to `commit`.
-SPINE = ("plan", "implement", "test", "review", "e2e", "docs", "commit")
+SPINE = ("plan", "implement", "test", "review", "e2e", "screens", "docs", "commit")
 STEP_SPINE = {"plan": "plan", "implement": "implement",
               "test": "test", "test_fix": "test",
               "review": "review", "review_fix": "review", "review_audit": "review",
               "e2e": "e2e", "e2e_fix": "e2e",
+              "screens": "screens",
               "docs": "docs", "commit": "commit"}
 RUN_STEPS = ("architect", "roadmap", "finalize", "done")
 TOKEN_FIELDS = ("in", "cache_w", "cache_r", "out", "think")

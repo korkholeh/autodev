@@ -134,8 +134,8 @@ The flags worth deciding on the first night:
 
 ```
 architect ─► roadmap ─► for each phase:
-   plan ─► implement (×N) ─► tests ─┬─► review ─┬─► e2e ─┬─► docs ─► commit + tag
-                                    │          │        └─► e2e_fix ─► docs
+   plan ─► implement (×N) ─► tests ─┬─► review ─┬─► e2e ─┬─► screens ─► docs ─► commit + tag
+                                    │          │        └─► e2e_fix ─► screens
                                     │          └─► review_fix ─► tests ─┬─► review (round 2)
                                     │                                   └─► audit (last round)
                                     └─► test_fix ─► tests
@@ -152,6 +152,9 @@ architect ─► roadmap ─► for each phase:
   go to a fix step, then round two. The fixes of the *last* round get a separate audit: a read-only session that sees
   only the fix diff and says whether the findings were really fixed.
 - **e2e** runs on phases marked user-facing, when you configured the services. It fixes the product, not the test.
+- **screens** photographs the product on user-facing phases: 3–6 states into
+  `.autodev/phases/NN-*/screenshots/`, captioned in that phase's `SCREENS.md`, committed with the phase. It never
+  changes code, and a phase with nothing to show says so. `--screens off` turns it off.
 - **docs** checks the documentation against the files this phase changed.
 - **commit** creates the phase commit, tags it `<branch>/phase-NN`, pushes, and (with `--pr`) opens a draft PR.
 - **finalize** reconciles all documentation with what was built and writes `.autodev/HANDOFF.md`.
@@ -188,7 +191,12 @@ Do this in order. It takes about twenty minutes and it is the whole point.
 is only assumed, the decisions worth overruling, known gaps, live risks, and what to do first. Everything below is
 you checking that this page is telling the truth.
 
-**2. Scan the warnings.** `.autodev/PROGRESS.md` has a warning column per phase and a run-warnings section. These are
+**2. Look at the pictures.** `.autodev/SCREENS.md` is the run's gallery, and each phase has its own
+`.autodev/phases/NN-*/SCREENS.md`. Thirty seconds of scrolling tells you whether the thing that was built is the
+thing you asked for — before you read a word of the diff. A caption saying the frame shows a bug is the run
+telling you where to look, not a failure of the step.
+
+**3. Scan the warnings.** `.autodev/PROGRESS.md` has a warning column per phase and a run-warnings section. These are
 the run telling on itself, and they are the highest-value paragraphs in the repository:
 
 | Warning | What it means for you |
@@ -199,8 +207,10 @@ the run telling on itself, and they are the highest-value paragraphs in the repo
 | `N PLAN.md task(s) left unchecked` | The phase shipped incomplete. |
 | `… said <claim> — but <probe>` | A session blamed the environment and the orchestrator disproved it. Whatever it skipped is undone, not impossible. |
 | `review round N changed the working tree itself` | The reviewer edited code. Those edits are in the commit, unreviewed. |
+| `the screenshot step changed the working tree` | The capture session edited the product after the review. Read that diff. |
+| `screenshots blocked: …` | No frames for that phase — usually a missing capture tool. The code is unaffected. |
 
-**3. Run the gate yourself, from a clean checkout.**
+**4. Run the gate yourself, from a clean checkout.**
 
 ```bash
 git checkout autodev/<branch>
@@ -209,7 +219,7 @@ git checkout autodev/<branch>
 
 If it does not pass on your machine, nothing else in the briefing matters yet.
 
-**4. Check that the tests can actually fail.** This is the one check nobody else can do for you, and it catches the
+**5. Check that the tests can actually fail.** This is the one check nobody else can do for you, and it catches the
 failure mode that matters: tests that assert nothing.
 
 ```bash
@@ -222,7 +232,7 @@ git checkout -- <the file you broke>
 Do this two or three times on the parts you care about most. A suite that stays green while the product is broken is
 the only really expensive outcome of a night like this.
 
-**5. Read the diff phase by phase**, not as one branch. With `--pr` each phase is its own draft PR with a body that
+**6. Read the diff phase by phase**, not as one branch. With `--pr` each phase is its own draft PR with a body that
 names what needs a close look. Without it:
 
 ```bash
@@ -230,14 +240,14 @@ git log --oneline main..autodev/<branch>
 git show <branch>/phase-03                # one phase at a time
 ```
 
-**6. Read `.autodev/DECISIONS.md` for the judgement calls.** It is a log, newest last, one `## ` section per step.
+**7. Read `.autodev/DECISIONS.md` for the judgement calls.** It is a log, newest last, one `## ` section per step.
 Read the architect's section and anything the handoff called out; grep the rest by topic. This is where you find the
 choices you would have made differently.
 
-**7. Check what was *not* verified.** The handoff separates verified from assumed. Typical residue: CI on other
+**8. Check what was *not* verified.** The handoff separates verified from assumed. Typical residue: CI on other
 platforms, anything needing a real network, anything needing a device. Those are yours to run.
 
-**8. Then decide.** Merge it, keep the branch and cherry-pick, or throw it away and improve the spec. A run that
+**9. Then decide.** Merge it, keep the branch and cherry-pick, or throw it away and improve the spec. A run that
 produced the wrong thing is usually a spec problem, and the second attempt from a sharper spec is much better than
 patching the first.
 
@@ -283,7 +293,7 @@ about twice one that is mostly mechanics.
 - Write a spec a stranger could build from, with acceptance criteria that suggest their own tests.
 - Answer the six questions properly; they are the last words you get in.
 - Let it run with a ceiling, and expect pauses.
-- In the morning: handoff, warnings, run the gate, **break something and watch a test fail**, then read the diff per
+- In the morning: handoff, the screenshots, warnings, run the gate, **break something and watch a test fail**, then read the diff per
   phase.
 - Treat the result as a strong first version by a developer who could not ask you anything.
 
