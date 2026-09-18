@@ -85,6 +85,7 @@ class ConfirmScreen(ModalScreen):
                 yield Button("Cancel", id="no")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()        # otherwise it bubbles on to the app's own button handler
         self.dismiss(event.button.id == "yes")
 
 
@@ -408,7 +409,9 @@ class Dashboard(App):
         self.push_screen(LogScreen())
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        {"stop": self.action_stop, "resume": self.action_resume, "log": self.action_log}[event.button.id]()
+        action = {"stop": self.action_stop, "resume": self.action_resume, "log": self.action_log}.get(event.button.id)
+        if action:          # buttons that live on a modal screen are not ours to act on
+            action()
 
 
 def main(light: bool = False) -> int:
